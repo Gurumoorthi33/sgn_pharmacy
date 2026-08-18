@@ -1,5 +1,5 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
+fastapi<0.100
+uvicorn
 python-multipart>=0.0.9
 requests>=2.31
 pillow>=10.0
@@ -7,3 +7,4 @@ pillow>=10.0
 #   pkg install libusb termux-api
 # On Debian/Ubuntu: sudo apt install libusb-1.0-0
 pyusb>=1.2.0
+pydantic<2,>=1.10
