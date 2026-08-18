@@ -12,8 +12,10 @@ instead of pretending to succeed.
 
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import app
+import send_test
 
 PASS = 0
 
@@ -236,6 +238,139 @@ def test_readiness_dispatch():
         app.PRINTER_IP = saved
 
 
+def test_send_test_find_out_bulk_real_descriptors():
+    # The worker must pick the OUT bulk endpoint from real descriptors, NOT
+    # assume it is 0x01 (Zebra printers can expose it elsewhere).
+
+    def ep(addr, attrs):
+        return SimpleNamespace(getAddress=lambda: addr, getAttributes=lambda: attrs)
+
+    def setting(num, cls, eps):
+        return SimpleNamespace(getNumber=lambda: num, getClass=lambda: cls, iterEndpoints=lambda: iter(eps))
+
+    def intf(settings):
+        return SimpleNamespace(iterSettings=lambda: iter(settings))
+
+    def cfg(val, intfs):
+        return SimpleNamespace(getConfigurationValue=lambda: val, iterInterfaces=lambda: iter(intfs))
+
+    # Printer-class interface whose OUT bulk endpoint is 0x02, not 0x01.
+    dev = SimpleNamespace(
+        iterConfigurations=lambda: iter([cfg(1, [intf([setting(0, 7, [ep(0x81, 2), ep(0x02, 2)])])])])
+    )
+    assert send_test._find_out_bulk(dev) == (0x02, 0, 1)
+
+    # No printer class -> falls back to the first OUT bulk (0x02), still not 0x01.
+    dev2 = SimpleNamespace(
+        iterConfigurations=lambda: iter([cfg(1, [intf([setting(0, 0xFF, [ep(0x82, 2), ep(0x02, 2)])])])])
+    )
+    assert send_test._find_out_bulk(dev2) == (0x02, 0, 1)
+
+    # Only IN endpoints -> loud failure, never a silent wrong guess.
+    dev3 = SimpleNamespace(
+        iterConfigurations=lambda: iter([cfg(1, [intf([setting(0, 7, [ep(0x81, 2)])])])])
+    )
+    try:
+        send_test._find_out_bulk(dev3)
+    except RuntimeError as exc:
+        assert "no OUT bulk endpoint" in str(exc)
+    else:
+        raise AssertionError("must raise when no OUT bulk endpoint exists")
+
+
+def test_send_test_write_retry_recovers_from_transient_io():
+    # A transient LIBUSB_ERROR_IO on the first transfer(s) must be retried and
+    # still succeed - some Android USB stacks do exactly this after a claim.
+    import sys
+
+    calls = {"bulk": 0}
+
+    class FakeUSBError(Exception):
+        pass
+
+    class FakeUSBErrorNoDevice(Exception):
+        pass
+
+    class FakeHandle:
+        def getDevice(self):
+            def ep(addr, attrs):
+                return SimpleNamespace(getAddress=lambda: addr, getAttributes=lambda: attrs)
+
+            def setting(num, cls, eps):
+                return SimpleNamespace(
+                    getNumber=lambda: num, getClass=lambda: cls, iterEndpoints=lambda: iter(eps),
+                    getAlternateSetting=lambda: 0, getNumEndpoints=lambda: len(eps),
+                )
+
+            def intf(settings):
+                return SimpleNamespace(iterSettings=lambda: iter(settings))
+
+            def cfg(val, intfs):
+                return SimpleNamespace(
+                    getConfigurationValue=lambda: val, iterInterfaces=lambda: iter(intfs),
+                    getNumInterfaces=lambda: len(intfs),
+                )
+
+            return SimpleNamespace(
+                getVendorID=lambda: send_test.ZEBRA_USB_VID,
+                getProductID=lambda: 0x0071,
+                iterConfigurations=lambda: iter(
+                    [cfg(1, [intf([setting(0, 7, [ep(0x01, 2)])])])]
+                ),
+            )
+
+        def getConfiguration(self):
+            return 1
+
+        def kernelDriverActive(self, i):
+            return False
+
+        def setAutoDetachKernelDriver(self, b):
+            return True
+
+        def claimInterface(self, i):
+            pass
+
+        def bulkWrite(self, endpoint, data, timeout=0):
+            calls["bulk"] += 1
+            if calls["bulk"] <= 2:
+                raise FakeUSBError("LIBUSB_ERROR_IO [-1]")
+            return len(data)
+
+        def attachKernelDriver(self, i):
+            pass
+
+        def close(self):
+            pass
+
+    fake_usb1 = SimpleNamespace(
+        USBError=FakeUSBError,
+        USBErrorNoDevice=FakeUSBErrorNoDevice,
+        getVersion=lambda: SimpleNamespace(major=1, minor=0, micro=27),
+        USBContext=type(
+            "USBContext",
+            (),
+            {
+                "__enter__": lambda self: self,
+                "__exit__": lambda *a: None,
+                "wrapSysDevice": lambda self, fd: FakeHandle(),
+            },
+        ),
+    )
+
+    old = sys.modules.get("usb1")
+    sys.modules["usb1"] = fake_usb1
+    try:
+        send_test.write_zpl(b"^XA^XZ", 1, 99)
+    finally:
+        if old is not None:
+            sys.modules["usb1"] = old
+        else:
+            del sys.modules["usb1"]
+
+    assert calls["bulk"] == 3, f"expected 3 attempts (2 transient + 1 success), got {calls['bulk']}"
+
+
 if __name__ == "__main__":
     print("platform detection + backend selection tests")
     check("platform detection across Windows/Termux/Linux", test_platform_detection)
@@ -247,4 +382,6 @@ if __name__ == "__main__":
     check("USB worker invocation + step-specific failure", test_usb_worker_invocation)
     check("CUPS path fails loudly for unknown queue", test_cups_path_fails_loudly_for_unknown_queue)
     check("readiness dispatch for unknown backend", test_readiness_dispatch)
+    check("worker picks OUT bulk endpoint from real descriptors", test_send_test_find_out_bulk_real_descriptors)
+    check("worker retries transient IO error on write", test_send_test_write_retry_recovers_from_transient_io)
     sys.exit(PASS)
