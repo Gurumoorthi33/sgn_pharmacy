@@ -54,5 +54,5 @@ export const DISPATCH_RESET_TIME = "23:40" // 11:40 PM IST daily reset
 export const REPORT_RECIPIENTS = ["supervisor.trc@sgnpharmacy.com", "manager.trc@sgnpharmacy.com"]
 
 export const HOSPITAL_NAME = "Trichy SRM Medical College Hospital and Research Centre"
-export const HOSPITAL_SHORT = "SRM Medical College Hospital"
+export const HOSPITAL_SHORT = "Trichy SRM Medical College Hospital and Research Centre"
 export const SYSTEM_NAME = "SGN Token System"

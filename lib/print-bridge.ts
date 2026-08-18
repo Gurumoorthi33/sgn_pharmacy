@@ -10,9 +10,23 @@ export const PRINT_BRIDGE_BASE = PRINT_BRIDGE_URL.replace(/\/+$/, "")
 export const LABEL_W_MM = 50
 export const LABEL_H_MM = 25
 
+// Error thrown by sendToPrintBridge. `responded` is true when the bridge was
+// reached but reported a printer failure (e.g. the ZD230 is offline), false
+// when the bridge itself could not be reached at all.
+export class PrintBridgeError extends Error {
+  readonly responded: boolean
+
+  constructor(message: string, responded: boolean) {
+    super(message)
+    this.name = "PrintBridgeError"
+    this.responded = responded
+  }
+}
+
 // POST the token data to the local Flask bridge, which renders it as ZPL and
-// sends raw bytes to the ZD230 (win32print raw queue, or TCP 9100). Crisp and
-// instant - the printer rasterizes the label itself, no browser scaling.
+// sends raw bytes to the ZD230 (win32print raw queue, or TCP 9100, or CUPS).
+// Crisp and instant - the printer rasterizes the label itself, no browser
+// scaling.
 export async function sendToPrintBridge(
   hospital: string,
   tokenNumber: number,
@@ -26,9 +40,10 @@ export async function sendToPrintBridge(
       body: JSON.stringify({ hospital, token_number: tokenNumber, copies }),
     })
   } catch (cause) {
-    throw new Error(
+    throw new PrintBridgeError(
       `could not reach print bridge at ${PRINT_BRIDGE_BASE} (${(cause as Error).message}). ` +
         `Start it on the PC attached to the ZD230: cd printer-bridge && python app.py`,
+      false,
     )
   }
   if (!res.ok) {
@@ -40,7 +55,7 @@ export async function sendToPrintBridge(
     } catch {
       // keep the status-only fallback
     }
-    throw new Error(`print bridge at ${PRINT_BRIDGE_BASE} returned: ${detail}`)
+    throw new PrintBridgeError(`print bridge at ${PRINT_BRIDGE_BASE} returned: ${detail}`, true)
   }
 }
 

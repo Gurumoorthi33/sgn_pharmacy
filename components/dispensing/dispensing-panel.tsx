@@ -3,7 +3,7 @@
 import { useRef, useState, useTransition } from "react"
 import { generateTokenAction } from "@/app/dispensing/actions"
 import { TokenLabel } from "@/components/dispensing/token-label"
-import { sendToPrintBridge, printLabelsViaIframe, PRINT_BRIDGE_URL } from "@/lib/print-bridge"
+import { sendToPrintBridge, printLabelsViaIframe, PRINT_BRIDGE_URL, PrintBridgeError } from "@/lib/print-bridge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { HOSPITAL_SHORT, type Token } from "@/lib/types"
@@ -23,6 +23,9 @@ export function DispensingPanel({ initialCount }: { initialCount: number }) {
   // Print two identical labels. Prefer the local ZD230 bridge (silent); if it is
   // configured but unreachable, fall back to an isolated print iframe (exactly
   // 2 pages) so tokens still print, and surface a warning so the kiosk can be fixed.
+  // When the bridge is reachable but the printer itself failed, show the real
+  // reason instead of silently falling back to a dialog that queues to the same
+  // broken printer.
   async function printToken(tokenNumber: number) {
     if (isPrintingRef.current) return
     isPrintingRef.current = true
@@ -32,6 +35,13 @@ export function DispensingPanel({ initialCount }: { initialCount: number }) {
           await sendToPrintBridge(HOSPITAL_SHORT, tokenNumber, 2)
           return
         } catch (bridgeErr) {
+          if (bridgeErr instanceof PrintBridgeError && bridgeErr.responded) {
+            setError(
+              `Printing failed: ${(bridgeErr as Error).message}. ` +
+                `The ZD230 did not print - check it is powered on and connected.`,
+            )
+            return
+          }
           setError(
             `Print bridge unreachable: ${(bridgeErr as Error).message}. ` +
               `Fell back to the browser print dialog.`,

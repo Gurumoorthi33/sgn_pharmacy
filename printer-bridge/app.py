@@ -60,6 +60,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -115,6 +116,76 @@ def zpl_escape(text: str) -> str:
     return ascii_only.replace("^", " ").replace("~", " ").strip()
 
 
+# Font A (Swiss 721 Bold Condensed) per-character advance widths in dots,
+# measured at 203 dpi on the ZPL engine itself at the reference size W=H=100
+# (render each char individually via api.labelary.com and subtract the single-
+# char bounding box from the double-char one). Advances scale linearly with the
+# ^A0N,h,h font height, so a width at any size is advance * h / 100.
+FONT_A_ADVANCE = {
+    " ": 30, "!": 29, '"': 48, "#": 48, "$": 48, "%": 90, "&": 61, "'": 29,
+    "(": 29, ")": 29, "*": 48, "+": 90, ",": 29, "-": 90, ".": 29, "/": 29,
+    "0": 48, "1": 48, "2": 48, "3": 48, "4": 48, "5": 48, "6": 48, "7": 48,
+    "8": 48, "9": 48, ":": 29, ";": 29, "<": 100, "=": 90, ">": 100, "?": 44,
+    "@": 90, "A": 55, "B": 55, "C": 53, "D": 59, "E": 50, "F": 50, "G": 59,
+    "H": 61, "I": 28, "J": 44, "K": 55, "L": 48, "M": 76, "N": 61, "O": 57,
+    "P": 55, "Q": 57, "R": 59, "S": 53, "T": 50, "U": 61, "V": 53, "W": 81,
+    "X": 55, "Y": 55, "Z": 50, "[": 29, "\\": 48, "]": 29, "^": 0, "_": 50,
+    "`": 29, "a": 46, "b": 50, "c": 44, "d": 50, "e": 48, "f": 28, "g": 50,
+    "h": 50, "i": 26, "j": 26, "k": 44, "l": 26, "m": 76, "n": 50, "o": 48,
+    "p": 50, "q": 50, "r": 33, "s": 42, "t": 28, "u": 50, "v": 44, "w": 66,
+    "x": 44, "y": 44, "z": 39, "{": 50, "|": 50, "}": 50, "~": 0,
+}
+# Fallback advance (upper-mid "0"/"n") for any char outside the table.
+FONT_A_DEFAULT_ADVANCE = 48
+
+# Token-number font: a SINGLE fixed size for every token number. This is the
+# height/weight that prints the approved "10" look, and a single-digit "1" must
+# render at exactly the same size and stroke weight - never a smaller, thinner
+# version. The token number is only ever scaled down when it has at least this
+# many digits AND would overflow the label width at full size; a hospital's
+# daily token count (1-3 digits) never reaches it, so 1-3 digit numbers always
+# keep the standard size. A 50x25mm label at 203 dpi fits ~8 digits at the
+# standard height, so this guard is effectively unreachable in practice.
+TOKEN_NUMBER_MIN_SHRINK_DIGITS = 4
+
+
+def font_a_width(text: str, height: int) -> int:
+    """Rendered width in dots of `text` at font-A `height` (W=H)."""
+    return sum(
+        round(FONT_A_ADVANCE.get(c, FONT_A_DEFAULT_ADVANCE) * height / 100.0)
+        for c in text
+    )
+
+
+def wrap_lines(text: str, usable: int, height: int) -> list[str]:
+    """Greedy word-wrap matching the ZPL ^FB field-block engine, so the line
+    count we compute is the line count the printer actually renders.
+
+    A word fits on the current line if the current width + a space + the word
+    stays within the field-block width; otherwise it starts a new line.
+    """
+    words = text.split()
+    if not words:
+        return [""]
+    space_w = font_a_width(" ", height)
+    lines: list[str] = []
+    cur = ""
+    cur_w = 0
+    for word in words:
+        word_w = font_a_width(word, height)
+        sep = space_w if cur else 0
+        if cur and cur_w + sep + word_w > usable:
+            lines.append(cur)
+            cur = word
+            cur_w = word_w
+        else:
+            cur = cur + " " + word if cur else word
+            cur_w += sep + word_w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def build_token_zpl(
     hospital: str,
     token_number: int,
@@ -126,47 +197,114 @@ def build_token_zpl(
 
     Layout is sized from the physical label dimensions so it holds for any
     label stock; all coordinates are in dots (203 dpi => 400x200 for 50x25mm).
+
+    Every block's Y is computed from the actual rendered height of the block
+    above it: the hospital name is wrapped with the printer's own font-A
+    metrics (see FONT_A_ADVANCE), so when it wraps to two lines the "TOKEN"
+    caption and the number shift down by exactly that wrapped height instead of
+    overlapping the second hospital line. The first block starts a couple of mm
+    below the physical top edge (top_offset) so the origin drift some printers
+    have does not clip the top line.
     """
     pw = round((width_mm / 25.4) * dpi)  # print width in dots
     ph = round((height_mm / 25.4) * dpi)  # label height in dots
     margin = max(4, round((1.5 / 25.4) * dpi))  # ~1.5mm quiet margin
     usable = pw - (2 * margin)
+    gap = max(4, round((0.6 / 25.4) * dpi))  # ~0.6mm between blocks / FB lines
+    # Extra top padding for the first (hospital) block only. On some printers the
+    # sensor-calibrated origin sits slightly above the physical top edge, so a
+    # ~2.5mm (20-dot) cushion keeps the top line clear of clipping.
+    top_offset = round((2.5 / 25.4) * dpi)
 
-    hospital_h = round(ph * 0.11)
+    hospital_h = round(ph * 0.09)
     caption_h = round(ph * 0.10)
-    number_h = round(ph * 0.44)
-    gap = round(ph * 0.03)
-
-    y1 = margin
-    y2 = y1 + hospital_h + gap
-    y3 = y2 + caption_h + gap
 
     hospital_s = zpl_escape(hospital)
     number_s = zpl_escape(str(int(token_number)))
+
+    # Token number: one fixed size for EVERY token number - this is what prints
+    # the approved "10" look. No digit-count-dependent auto-fit: a single-digit
+    # "1" must render at the identical size and bold stroke as "10" (Font A is
+    # proportional, so the ^A0N width slot is a no-op, but h == w mirrors the
+    # approved label). We only deviate when the number is BOTH at least
+    # TOKEN_NUMBER_MIN_SHRINK_DIGITS digits long AND overflows the label width
+    # at full size - then the height is scaled proportionally so the widest
+    # digit still fits without truncation. 1-3 digit tokens always keep the
+    # standard size; they are never shrunk.
+    number_h = round(ph * 0.44)
+    number_w = number_h
+    if len(number_s) >= TOKEN_NUMBER_MIN_SHRINK_DIGITS:
+        full_width = font_a_width(number_s, number_h)
+        if full_width > usable:
+            number_h = max(round(number_h * usable / full_width), 1)
+            number_w = number_h
+
+    # How many lines the hospital name really occupies on the label width.
+    n_lines = len(wrap_lines(hospital_s, usable, hospital_h))
+    if n_lines > 2:
+        # A 50x25mm label cannot hold 3 hospital lines plus the big number;
+        # the ^FB field truncates the tail (unchanged behaviour) but the blocks
+        # below never overlap because they are positioned after 2 full lines.
+        n_lines = 2
+    # Rendered height of the hospital ^FB block: one font-height cell per line
+    # plus the inter-line gap (this is how the FB block advances its lines).
+    hospital_block_h = n_lines * hospital_h + (n_lines - 1) * gap
+
+    y1 = margin + top_offset
+    y2 = y1 + hospital_block_h + gap
+    y3 = y2 + caption_h + gap
 
     zpl = (
         "^XA"
         f"^PW{pw}"
         f"^LL{ph}"
         f"^LH0,0"
-        # Hospital name (wraps up to 2 lines, centred)
-        f"^FO{margin},{y1}^FB{usable},2,{gap},C^A0N,{hospital_h},{hospital_h}^FD{hospital_s}^FS"
-        # "TOKEN" caption, centred
+        # Hospital name (wraps across n_lines, centred, auto-wrapped with the
+        # printer's own font-A metrics)
+        f"^FO{margin},{y1}^FB{usable},{n_lines},{gap},C^A0N,{hospital_h},{hospital_h}^FD{hospital_s}^FS"
+        # "TOKEN" caption, centred, below the hospital block's rendered height
         f"^FO{margin},{y2}^FB{usable},1,{gap},C^A0N,{caption_h},{caption_h}^FDTOKEN^FS"
-        # Big token number, centred
-        f"^FO{margin},{y3}^FB{usable},1,0,C^A0N,{number_h},{number_h}^FD{number_s}^FS"
+        # Big token number, centred, fixed size for every token number
+        f"^FO{margin},{y3}^FB{usable},1,0,C^A0N,{number_h},{number_w}^FD{number_s}^FS"
         "^XZ"
     )
     return zpl
 
 
 # --- ZPL output backends -------------------------------------------------
+def ensure_win32_printer_ready(printer: str) -> None:
+    """Fail loudly if the Windows queue cannot physically print right now.
+
+    OpenPrinter/WritePrinter succeed even when the queue is offline or paused -
+    the job just sits in the spooler - so the bridge would otherwise report
+    success while nothing prints. Check the spooler status flags first.
+    """
+    if not ZPL_WINDOWS:
+        raise RuntimeError("win32print not available on this machine.")
+    hprinter = win32print.OpenPrinter(printer)
+    try:
+        info = win32print.GetPrinter(hprinter, 2)
+    finally:
+        win32print.ClosePrinter(hprinter)
+    status = info.get("Status", 0)
+    if status & getattr(win32print, "PRINTER_STATUS_OFFLINE", 0):
+        raise RuntimeError(f"printer '{printer}' is offline - check its power and connection")
+    if status & getattr(win32print, "PRINTER_STATUS_PAUSED", 0):
+        raise RuntimeError(f"printer '{printer}' is paused in the Windows spooler")
+    if status & getattr(win32print, "PRINTER_STATUS_OUT_OF_PAPER", 0):
+        raise RuntimeError(f"printer '{printer}' is out of label media")
+    if status & getattr(win32print, "PRINTER_STATUS_ERROR", 0):
+        raise RuntimeError(f"printer '{printer}' is in an error state")
+
+
 def print_zpl_win32(zpl: bytes, copies: int = 1) -> None:
     """Send raw ZPL bytes to the Windows ZPL driver queue (no re-rendering)."""
     if not ZPL_WINDOWS:
         raise RuntimeError("win32print not available on this machine.")
     if not PRINTER_NAME:
         raise RuntimeError("PRINTER_NAME is not set.")
+
+    ensure_win32_printer_ready(PRINTER_NAME)
 
     hprinter = win32print.OpenPrinter(PRINTER_NAME)
     try:
@@ -190,6 +328,74 @@ def print_zpl_socket(zpl: bytes, copies: int = 1) -> None:
             sock.sendall(zpl)
 
 
+def cups_printer_status(printer: str) -> str:
+    """Raw `lpstat -p <printer>` status text ("" when unknown).
+
+    Example healthy output:
+        printer ZTC-ZD230-203dpi-ZPL is idle.  enabled since ...
+    When the physical device is missing the queue shows:
+        printer ZTC-ZD230-203dpi-ZPL now printing ZTC-ZD230-203dpi-ZPL-177.
+                Waiting for printer to become available.
+    """
+    lpstat = shutil.which("lpstat")
+    if not lpstat:
+        return ""
+    proc = subprocess.run([lpstat, "-p", printer], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def cups_printer_ready(printer: str) -> tuple[bool, str]:
+    """True only when CUPS can actually reach the physical printer.
+
+    CUPS accepts jobs into the spool even when the device is unplugged/off,
+    silently holding them ("Waiting for printer to become available") and the
+    bridge would otherwise report success. Detect that state up front so the
+    print fails loudly instead of looking like it worked.
+    """
+    status = cups_printer_status(printer)
+    if not status:
+        return False, (
+            f"printer '{printer}' was not found in CUPS - check 'lpstat -p {printer}'"
+        )
+    if "disabled" in status:
+        return False, f"printer '{printer}' is disabled in CUPS (run: cupsenable {printer})"
+    if "Waiting for printer to become available" in status or "not connected" in status:
+        return False, (
+            f"printer '{printer}' is not reachable - power on the ZD230 and "
+            "check its USB cable is connected"
+        )
+    return True, status
+
+
+def verify_cups_job(lp_output: str, timeout: float = 15.0) -> None:
+    """Wait for a submitted CUPS job to leave the spooler.
+
+    `lp` returns exit 0 as soon as the job is spooled, not when it prints. If
+    the device is offline the job just sits in the queue forever and the caller
+    would otherwise report success while nothing prints. Poll until the job is
+    gone or raise with the real reason.
+    """
+    match = re.search(r"request id is (\S+)", lp_output)
+    if not match:
+        return
+    job_id = match.group(1)
+    lpstat = shutil.which("lpstat") or "lpstat"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        proc = subprocess.run(
+            [lpstat, "-o", job_id], capture_output=True, text=True, check=False
+        )
+        if job_id not in proc.stdout:
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"CUPS job {job_id} is still queued and never printed - power on the ZD230, "
+        "check its USB connection, and make sure label media is loaded."
+    )
+
+
 def print_zpl_cups(zpl: bytes, copies: int = 1) -> None:
     """Send raw ZPL to a CUPS queue on Linux (USB-attached Zebra).
 
@@ -203,17 +409,22 @@ def print_zpl_cups(zpl: bytes, copies: int = 1) -> None:
     if not PRINTER_NAME:
         raise RuntimeError("PRINTER_NAME is not set.")
 
+    ok, why = cups_printer_ready(PRINTER_NAME)
+    if not ok:
+        raise RuntimeError(f"CUPS printer check failed: {why}")
+
     for _ in range(max(1, copies)):
         proc = subprocess.run(
             [lp, "-d", PRINTER_NAME, "-o", "raw"],
             input=zpl,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
         if proc.returncode != 0:
             detail = proc.stderr.decode(errors="replace").strip()
             raise RuntimeError(detail or f"lp command failed (exit {proc.returncode})")
+        verify_cups_job(proc.stdout.decode(errors="replace"))
 
 
 # --- Legacy image path (unchanged behaviour) -----------------------------
@@ -255,6 +466,8 @@ def print_image(image_path: str, printer_name: str, copies: int = 1) -> None:
 # --- Routes ---------------------------------------------------------------
 @app.get("/health")
 def health():
+    lp_available = bool(shutil.which("lp"))
+    cups_status = cups_printer_status(PRINTER_NAME) if (PRINTER_NAME and lp_available) else ""
     return {
         "ok": True,
         "printer": PRINTER_NAME,
@@ -265,12 +478,16 @@ def health():
             else "win32print"
             if (PRINTER_NAME and ZPL_WINDOWS)
             else "cups-lp"
-            if (PRINTER_NAME and shutil.which("lp"))
+            if (PRINTER_NAME and lp_available)
             else "none"
         ),
         "zpl_windows": ZPL_WINDOWS,
         "image_windows": IMAGE_WINDOWS,
-        "lp_available": bool(shutil.which("lp")),
+        "lp_available": lp_available,
+        "cups_status": cups_status,
+        "cups_printer_ready": not (
+            cups_status and ("disabled" in cups_status or "Waiting for printer to become available" in cups_status)
+        ),
         "label_mm": [ZPL_WIDTH_MM, ZPL_HEIGHT_MM],
         "dpi": PRINTER_DPI,
     }
