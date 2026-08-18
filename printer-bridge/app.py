@@ -7,8 +7,11 @@ runs unchanged on three kinds of host - the send path is picked automatically
 from the detected platform, never from which env vars happen to be set:
 
 * Windows PC (win32print queue, e.g. "ZDesigner ZD230-203dpi ZPL", or CUPS).
-* Sunmi T2s Lite running Termux/Android - USB-attached ZD230 via pyusb
-  (vendor 0x0A5F), with termux-usb used to grant Android USB permission.
+* Sunmi T2s Lite running Termux/Android - USB-attached ZD230 (vendor 0x0A5F)
+  reached through the file descriptor termux-usb grants (Termux sandboxes
+  /dev/bus/usb/*, so pyusb-style enumeration can never see the device): the
+  send_test.py worker wraps that fd with python-libusb1's wrapSysDevice() and
+  bulk-writes the ZPL.
 * Generic Linux (dev/testing) - CUPS queue, e.g. "ZTC-ZD230-203dpi-ZPL".
 
 A PRINTER_IP override forces the TCP 9100 path on any platform (the future
@@ -38,7 +41,10 @@ Setup (Sunmi T2s Lite / Termux):
     uv venv --python 3.12
     uv pip install --python .venv/bin/python -r requirements.txt
     termux-usb -l                      # plug the ZD230 in via OTG, confirm it lists
-    termux-usb -r <device>             # grant Android USB permission (first run)
+    # Identify the ZD230's /dev/bus/usb/... path - a hub/controller may list too:
+    #   termux-usb -r -e "echo granted" <path>   # repeat per listed path; the
+    # Android dialog that names the ZD230 wins. Pin it with
+    # PRINTER_USB_PATH=<path> if you like.
     uv run app.py                      # auto-detects Android/Termux -> USB path
 
 Environment:
@@ -50,6 +56,9 @@ Environment:
                     future network fallback). PRINTER_HOST is accepted as a
                     legacy alias.
     PRINTER_PORT    Raw socket port for PRINTER_IP (default 9100).
+    PRINTER_USB_PATH  Android/Termux only: exact /dev/bus/usb/... path of the
+                      ZD230 from termux-usb -l. Optional - the bridge falls back
+                      to the device matching vendor 0x0A5F, then to a sole device.
     PRINTER_DPI     203 for the standard ZD230.
     ZPL_WIDTH_MM    Physical label width in mm (default 50 - standard 2" roll).
     ZPL_HEIGHT_MM   Physical label height in mm (default 25).
@@ -70,9 +79,12 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
+import sys
+import tempfile
 import time
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -99,15 +111,20 @@ try:
 except Exception:  # pragma: no cover - non-Windows machines
     IMAGE_WINDOWS = False
 
-# USB path (Android/Termux). pyusb imports fine without the libusb runtime
-# library; the backend only fails when actually used, which we surface clearly.
+# USB path (Android/Termux). python-libusb1 is a pure-Python ctypes wrapper:
+# importing it never needs the libusb runtime, but USBContext()/wrapSysDevice()
+# do - we surface that clearly when it fails at use time. pyusb cannot work here:
+# Termux hands USB access out as a file descriptor, not an enumerable device.
 try:
-    import usb.core
-    import usb.util
+    import usb1  # noqa: F401 - import proves the wrapper is installed
 
-    USB_PYUSB = True
-except Exception:  # pragma: no cover - USB lib not installed
-    USB_PYUSB = False
+    USB_LIBUSB1 = True
+except Exception:  # pragma: no cover - libusb1 not installed
+    USB_LIBUSB1 = False
+
+USB_METHOD = "termux-usb fd + libusb1 wrapSysDevice (send_test.py worker)"
+USB_TERMUX_DIALOG_TIMEOUT_S = 90
+SEND_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "send_test.py")
 
 LOG = logging.getLogger("sgn-print-bridge")
 
@@ -126,6 +143,7 @@ UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join(os.getcwd(), "sgn-p
 PRINTER_NAME = os.environ.get("PRINTER_NAME", "")
 PRINTER_IP = os.environ.get("PRINTER_IP") or os.environ.get("PRINTER_HOST") or ""
 PRINTER_PORT = int(os.environ.get("PRINTER_PORT", "9100"))
+PRINTER_USB_PATH = os.environ.get("PRINTER_USB_PATH", "")
 PRINTER_DPI = int(os.environ.get("PRINTER_DPI", "203"))
 ZPL_WIDTH_MM = int(os.environ.get("ZPL_WIDTH_MM", "50"))
 ZPL_HEIGHT_MM = int(os.environ.get("ZPL_HEIGHT_MM", "25"))
@@ -175,7 +193,7 @@ BACKEND_LABEL = {
     "socket": "TCP 9100",
     "win32print": "Windows win32print",
     "cups": "CUPS (lp)",
-    "usb": "USB (pyusb)",
+    "usb": "USB (termux-usb + libusb1 wrapSysDevice)",
     "none": "none",
 }
 
@@ -570,12 +588,24 @@ def cups_readiness() -> tuple[bool, str]:
     return False, f"CUPS queue '{PRINTER_NAME}' not ready: {why}"
 
 
-# --- USB (pyusb / Termux) ------------------------------------------------
-def termux_usb_devices() -> list[tuple[str, int, int, str]]:
-    """Run `termux-usb -l` and parse the connected devices.
+# --- USB (Termux/Android) --------------------------------------------------
+# Termux sandboxes /dev/bus/usb/*: Android hands out a *file descriptor* for the
+# granted device (termux-usb), which pyusb-style enumeration can never see. We
+# send ZPL by running the standalone worker (send_test.py) through
+#     termux-usb -r -e "<python> send_test.py <zpl> --copies N" <device>
+# so the granted fd reaches wrapSysDevice() the supported way. The worker names
+# the failing step (device wrap / interface claim / write) so the bridge can
+# surface it instead of a generic 500.
+USB_DEV_PATH_RE = re.compile(r"(/dev/bus/usb/\d+/\d+)")
+USB_VIDPID_RE = re.compile(r"\b(?:0x)?([0-9a-fA-F]{4}):(?:0x)?([0-9a-fA-F]{4})\b")
 
-    Returns [(device_token, vid, pid, raw_line), ...]. Raises RuntimeError when
-    termux-usb is missing or exits non-zero.
+
+def termux_usb_devices() -> list[tuple[str, int | None, int | None, str]]:
+    """Run `termux-usb -l` and parse device paths (+ optional VID:PID).
+
+    Returns [(device_path, vid, pid, raw_line), ...]; vid/pid are None when the
+    listing does not include them. Raises RuntimeError when termux-usb is
+    missing or exits non-zero.
     """
     termux_usb = shutil.which("termux-usb")
     if not termux_usb:
@@ -587,144 +617,137 @@ def termux_usb_devices() -> list[tuple[str, int, int, str]]:
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"termux-usb -l failed (exit {proc.returncode})")
-    devices: list[tuple[str, int, int, str]] = []
+    devices: list[tuple[str, int | None, int | None, str]] = []
     for line in proc.stdout.splitlines():
-        m = re.search(r"\b(?:0x)?([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\b", line)
+        m = USB_DEV_PATH_RE.search(line)
         if not m:
             continue
-        vid, pid = int(m.group(1), 16), int(m.group(2), 16)
-        devices.append((line.split()[0], vid, pid, line.strip()))
+        vid = pid = None
+        vm = USB_VIDPID_RE.search(line)
+        if vm:
+            vid, pid = int(vm.group(1), 16), int(vm.group(2), 16)
+        devices.append((m.group(1), vid, pid, line.strip()))
     return devices
 
 
-def termux_usb_find_zebra() -> tuple[str, int, str] | None:
-    """First Zebra device (vendor 0x0A5F) listed by termux-usb, or None."""
-    for token, vid, pid, line in termux_usb_devices():
-        if vid == ZEBRA_USB_VID:
-            return token, pid, line
-    return None
+def resolve_usb_target() -> str:
+    """Which /dev/bus/usb/... path to print to.
 
-
-def grant_termux_usb_permission() -> None:
-    """Best-effort request of Android USB permission for the Zebra device.
-
-    Triggers the Termux:API permission dialog so pyusb can open the device.
-    Non-fatal when it fails - pyusb reports the real error afterwards.
+    PRINTER_USB_PATH (recorded from the termux-usb permission dialogs) wins;
+    otherwise the single Zebra VID 0x0A5F device is used, then a sole device.
+    Multiple non-Zebra devices fail loudly asking for PRINTER_USB_PATH.
     """
-    if not shutil.which("termux-usb"):
-        return
-    try:
-        found = termux_usb_find_zebra()
-    except Exception:  # noqa: BLE001 - probe problems reported by pyusb later
-        return
-    if found:
-        token, _, _ = found
-        subprocess.run(
-            ["termux-usb", "-r", token], capture_output=True, timeout=10, check=False
+    if PRINTER_USB_PATH:
+        return PRINTER_USB_PATH
+    devices = termux_usb_devices()
+    zebras = [d for d in devices if d[1] == ZEBRA_USB_VID]
+    if zebras:
+        return zebras[0][0]
+    if len(devices) == 1:
+        return devices[0][0]
+    if not devices:
+        raise RuntimeError(
+            "no USB devices listed by termux-usb -l - is the ZD230 powered on "
+            "and plugged into the OTG adapter?"
         )
+    paths = ", ".join(d[0] for d in devices)
+    raise RuntimeError(
+        f"{len(devices)} USB devices listed ({paths}) and none matches the Zebra "
+        "vendor 0x0A5F - set PRINTER_USB_PATH to the ZD230's path (find it by "
+        "running 'termux-usb -r -e \"echo granted\" <path>' for each listed device "
+        "and keeping the one whose Android dialog names the ZD230)"
+    )
 
 
 def usb_readiness() -> tuple[bool, str]:
-    """(ok, detail) for the USB path - device found AND usable right now."""
-    if not USB_PYUSB:
+    """(ok, detail) for the USB path - wrapper, tooling and target present.
+
+    A full write probe is intentionally NOT done here: it would trigger the
+    Android permission dialog on every request. Real failures surface loudly at
+    print time through the worker's step-specific errors.
+    """
+    if not USB_LIBUSB1:
         return (
             False,
-            "pyusb is not installed - pip install pyusb (on Termux also: pkg install libusb)",
+            "libusb1 is not installed - pip install libusb1 "
+            "(on Termux also: pkg install libusb)",
         )
-    termux_seen = None
-    if shutil.which("termux-usb"):
-        try:
-            termux_seen = termux_usb_find_zebra()
-        except Exception as exc:  # noqa: BLE001
-            return False, f"termux-usb probe failed: {exc}"
+    if not shutil.which("termux-usb"):
+        return (
+            False,
+            "termux-usb not found - install the Termux:API add-on (pkg install termux-api)",
+        )
+    if not os.path.isfile(SEND_WORKER):
+        return False, f"USB worker script missing: {SEND_WORKER}"
     try:
-        dev = usb.core.find(idVendor=ZEBRA_USB_VID)
-    except usb.core.NoBackendError:
-        return (
-            False,
-            "pyusb installed but no libusb backend - install libusb "
-            "(on Termux: pkg install libusb; on Debian/Ubuntu: apt install libusb-1.0-0)",
-        )
-    except Exception as exc:  # noqa: BLE001
-        return False, f"pyusb enumeration failed: {exc}"
-    if dev is None:
-        if termux_seen:
-            return (
-                False,
-                "Zebra ZD230 is listed by termux-usb but not usable by pyusb - run "
-                "'termux-usb -r <device>' to grant permission, or start Termux as root",
-            )
-        return (
-            False,
-            "Zebra ZD230 (vendor 0x0A5F) not found on USB - check the OTG cable "
-            "and that the printer is powered on",
-        )
-    return True, "Zebra ZD230 detected on USB (permission granted)"
+        device = resolve_usb_target()
+    except RuntimeError as exc:
+        return False, str(exc)
+    try:
+        with usb1.USBContext():
+            usb1.getVersion()  # context creation loads libusb; raises if absent
+    except Exception as exc:  # noqa: BLE001 - libusb runtime missing
+        return False, f"libusb runtime unavailable: {exc}"
+    return True, f"ZD230 target: {device}; {USB_METHOD} (full write probe happens at print time)"
 
 
 def print_zpl_usb(zpl: bytes, copies: int = 1) -> None:
-    """Send raw ZPL to a USB-attached Zebra via pyusb (Android/Termux)."""
-    if not USB_PYUSB:
-        raise RuntimeError(
-            "USB print path requires pyusb - pip install pyusb (on Termux also: "
-            "pkg install libusb)"
-        )
-    grant_termux_usb_permission()
-    try:
-        dev = usb.core.find(idVendor=ZEBRA_USB_VID)
-    except usb.core.NoBackendError:
-        raise RuntimeError(
-            "USB print path has no libusb backend - install libusb "
-            "(on Termux: pkg install libusb)"
-        ) from None
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"USB device lookup failed: {exc}") from exc
-    if dev is None:
-        raise RuntimeError(
-            "USB write failed: Zebra ZD230 (vendor 0x0A5F) not found - is it powered "
-            "on and plugged into the OTG adapter?"
-        )
+    """Send raw ZPL to a USB ZD230 on Android/Termux.
 
-    ep_out = None
-    intf = None
+    Runs the standalone worker (send_test.py) through termux-usb -r -e so the
+    granted device fd reaches wrapSysDevice() the supported way - never pyusb-
+    style enumeration, which Termux's sandbox breaks. The worker exits non-zero
+    (and prints ERROR: <step>) on any failure, which we surface as an HTTP 500.
+    """
+    termux_usb = shutil.which("termux-usb")
+    if not termux_usb:
+        raise RuntimeError(
+            "USB print path requires termux-usb - install the Termux:API add-on "
+            "(pkg install termux-api)"
+        )
+    device = resolve_usb_target()
+    if not os.path.isfile(SEND_WORKER):
+        raise RuntimeError(f"USB worker script missing: {SEND_WORKER}")
+
+    fd_path = None
     try:
-        dev.set_configuration()
-        cfg = dev.get_active_configuration()
-        for candidate in cfg:
-            if candidate.bInterfaceClass == 7:  # printer class
-                intf = candidate
-                break
-        if intf is None:
-            intf = cfg[(0, 0)]
-        for ep in intf:
-            if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT:
-                ep_out = ep
-                break
-        if ep_out is None:
-            raise RuntimeError("USB write failed: no OUT endpoint found on the ZD230")
-        usb.util.claim_interface(dev, intf)
-        for _ in range(max(1, copies)):
-            written = ep_out.write(zpl, timeout=USB_WRITE_TIMEOUT_MS)
-            if written != len(zpl):
-                raise RuntimeError(
-                    f"USB write incomplete: sent {written} of {len(zpl)} bytes"
-                )
-    except usb.core.USBError as exc:
-        err = str(exc).lower()
-        if "access" in err or "permission" in err:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix="sgn-zpl-", suffix=".zpl", delete=False
+        ) as fh:
+            fh.write(zpl)
+            fd_path = fh.name
+        command = " ".join(
+            shlex.quote(a)
+            for a in [sys.executable, SEND_WORKER, fd_path, "--copies", str(copies)]
+        )
+        try:
+            proc = subprocess.run(
+                [termux_usb, "-r", "-e", command, device],
+                capture_output=True,
+                text=True,
+                timeout=USB_TERMUX_DIALOG_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
             raise RuntimeError(
-                "USB permission denied - run 'termux-usb -r <device>' to grant access, "
-                "or start Termux as root"
-            ) from exc
-        if "no device" in err or "disconnect" in err:
-            raise RuntimeError("USB write failed: the ZD230 was disconnected mid-print") from exc
-        raise RuntimeError(f"USB write failed: {exc}") from exc
+                f"USB print timed out after {USB_TERMUX_DIALOG_TIMEOUT_S}s - "
+                "termux-usb may be stuck on the Android permission dialog or the "
+                "ZD230 is not responding"
+            ) from None
     finally:
-        if intf is not None:
+        if fd_path:
             try:
-                usb.util.release_interface(dev, intf)
-            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                os.unlink(fd_path)
+            except OSError:
                 pass
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0 or "OK ZEBRA-USB" not in out:
+        raise RuntimeError(
+            "USB write failed (worker exit {}): {}".format(
+                proc.returncode, err or out or "no output from termux-usb"
+            )
+        )
 
 
 # --- Legacy image path (unchanged behaviour) -----------------------------
@@ -804,7 +827,8 @@ def health():
         "backend_label": BACKEND_LABEL[BACKEND],
         "zpl_windows": ZPL_WINDOWS,
         "image_windows": IMAGE_WINDOWS,
-        "usb_pyusb": USB_PYUSB,
+        "usb_libusb1": USB_LIBUSB1,
+        "usb_method": USB_METHOD,
         "lp_available": lp_available,
         "cups_status": cups_status,
         "cups_printer_ready": not (
@@ -820,7 +844,7 @@ def print_diagnostics():
     """One-request report: platform, active send path, and a live readiness
     probe so "will this bridge actually print right now" is a single call."""
     checks = {}
-    if PLATFORM == "android" or USB_PYUSB:
+    if PLATFORM == "android" or USB_LIBUSB1:
         ok, detail = usb_readiness()
         checks["usb"] = {"ready": ok, "detail": detail}
     if ZPL_WINDOWS:
@@ -842,6 +866,7 @@ def print_diagnostics():
         "backend_label": BACKEND_LABEL[BACKEND],
         "backend_ready": active_ok,
         "backend_detail": active_detail,
+        "usb_method": USB_METHOD,
         "printer_name": PRINTER_NAME or None,
         "printer_ip": PRINTER_IP or None,
         "checks": checks,
@@ -882,7 +907,8 @@ def print_zpl_api(payload: ZplRequest):
                 detail=(
                     f"No print backend is configured for platform {PLATFORM_LABEL}. "
                     "On Windows set PRINTER_NAME to the ZD230 queue; on Android/Termux "
-                    "connect the ZD230 over USB (pyusb); or set PRINTER_IP to force "
+                    "connect the ZD230 over USB (termux-usb + libusb1); or set "
+                    "PRINTER_IP to force "
                     "the TCP 9100 path on any machine."
                 ),
             )
