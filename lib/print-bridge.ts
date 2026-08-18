@@ -23,10 +23,11 @@ export class PrintBridgeError extends Error {
   }
 }
 
-// POST the token data to the local Flask bridge, which renders it as ZPL and
-// sends raw bytes to the ZD230 (win32print raw queue, or TCP 9100, or CUPS).
-// Crisp and instant - the printer rasterizes the label itself, no browser
-// scaling.
+// POST the token data to the local bridge, which renders it as ZPL and
+// sends raw bytes to the ZD230. The bridge auto-selects its send path from the
+// detected platform (win32print / CUPS on Windows+Linux, USB on Android/Termux,
+// or TCP 9100 when PRINTER_IP is set). Crisp and instant - the printer
+// rasterizes the label itself, no browser scaling.
 export async function sendToPrintBridge(
   hospital: string,
   tokenNumber: number,

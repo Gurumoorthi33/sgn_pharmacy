@@ -1,23 +1,30 @@
 """
 SGN Token System - Local print bridge for the Zebra ZD230.
 
-Run this small FastAPI service on the same Windows PC that the ZD230 is
-attached to. The dispensing screen POSTs the token data here and this service
-prints it silently (no browser dialog), as many copies as requested.
+Run this small FastAPI service next to the ZD230 and it prints labels
+silently (no browser dialog), as many copies as requested. The same app.py
+runs unchanged on three kinds of host - the send path is picked automatically
+from the detected platform, never from which env vars happen to be set:
 
-Two print paths:
+* Windows PC (win32print queue, e.g. "ZDesigner ZD230-203dpi ZPL", or CUPS).
+* Sunmi T2s Lite running Termux/Android - USB-attached ZD230 via pyusb
+  (vendor 0x0A5F), with termux-usb used to grant Android USB permission.
+* Generic Linux (dev/testing) - CUPS queue, e.g. "ZTC-ZD230-203dpi-ZPL".
 
-* ZPL (recommended - crisp, instant): POST JSON to /api/print/zpl/ with
-  {"hospital": "...", "token_number": 4, "copies": 2} (or a raw
-  {"zpl": "^XA^FO50,50^A0N,100,100^FDTOKEN 4^FS^XZ"} for full control).
-  The bridge builds the ZPL label-format program and sends the raw bytes
-  straight to the printer - either through the Windows ZPL driver queue via
-  win32print, or directly over TCP to the printer's 9100 port. Because the
-  ZD230 rasterizes ZPL itself at 203 dpi there is no browser scaling, so text
-  is always sharp and each label is exactly one sticker.
+A PRINTER_IP override forces the TCP 9100 path on any platform (the future
+network-printing fallback).
 
-* Image (legacy): POST a PNG to /api/print/ (multipart form "image" file +
-  "copies" field). Kept for backwards compatibility.
+API:
+
+* /api/print/zpl/   POST JSON {"hospital": "...", "token_number": 4, "copies": 2}
+                    (or raw {"zpl": "^XA^FO50,50^A0N,100,100^FDTOKEN 4^FS^XZ"}).
+                    Returns a real 4xx/5xx error whenever the printer did not
+                    actually receive the bytes - never a false "success".
+* /api/print/diagnostics  one-request readiness report: detected platform,
+                    active send path, and a live check that the printer is
+                    actually reachable right now.
+* /api/print/       legacy PNG path (Windows only, unchanged).
+* /health           basic liveness + platform/backend summary.
 
 Setup (Windows):
     uv venv --python 3.12
@@ -26,19 +33,23 @@ Setup (Windows):
     set UPLOAD_FOLDER=C:\\sgn-prints
     uv run app.py
 
-Non-Windows (dev/testing only - the ZD230 needs Windows):
+Setup (Sunmi T2s Lite / Termux):
+    pkg install python libusb termux-api
     uv venv --python 3.12
     uv pip install --python .venv/bin/python -r requirements.txt
-    uv run app.py   # /health works; printing reports "not available"
+    termux-usb -l                      # plug the ZD230 in via OTG, confirm it lists
+    termux-usb -r <device>             # grant Android USB permission (first run)
+    uv run app.py                      # auto-detects Android/Termux -> USB path
 
-Environment (ZPL path):
-    PRINTER_NAME    Windows queue for the ZD230. For the best result install
-                    Zebra's "ZDesigner ZD230-203dpi ZPL" driver and set this
-                    to that queue name.
-    PRINTER_HOST    Optional IP/hostname of a networked ZD230. When set, the
-                    bridge sends raw ZPL to PRINTER_PORT (default 9100)
-                    instead of using win32print.
-    PRINTER_PORT    Raw socket port for PRINTER_HOST (default 9100).
+Environment:
+    PRINTER_NAME    Windows ZPL driver queue, or the CUPS queue name on
+                    Linux/Termux (e.g. "ZTC-ZD230-203dpi-ZPL"). Only consulted
+                    on platforms where win32print/CUPS exist.
+    PRINTER_IP      Optional IP/hostname of a networked ZD230. Forces the TCP
+                    9100 send path on any platform (manual override for the
+                    future network fallback). PRINTER_HOST is accepted as a
+                    legacy alias.
+    PRINTER_PORT    Raw socket port for PRINTER_IP (default 9100).
     PRINTER_DPI     203 for the standard ZD230.
     ZPL_WIDTH_MM    Physical label width in mm (default 50 - standard 2" roll).
     ZPL_HEIGHT_MM   Physical label height in mm (default 25).
@@ -52,10 +63,12 @@ NEXT_PUBLIC_PRINT_BRIDGE_URL to http://localhost:5000 in the web app.
 The service binds to 0.0.0.0 by default so it is reachable from other devices
 on the LAN too. If you access the web app from another device, set
 NEXT_PUBLIC_PRINT_BRIDGE_URL to http://<THIS_PC_LAN_IP>:5000 instead of
-localhost and allow port 5000 through the Windows firewall.
+localhost and allow port 5000 through the firewall.
 """
 
+import logging
 import os
+import platform
 import re
 import shutil
 import socket
@@ -66,13 +79,13 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# --- Windows printing capabilities -------------------------------------
-# ZPL raw printing only needs pywin32's win32print.
+# --- Printing capabilities -------------------------------------------
+# ZPL raw printing only needs pywin32's win32print (Windows).
 try:
     import win32print
 
     ZPL_WINDOWS = True
-except Exception:  # pragma: no cover - non-Windows dev machines
+except Exception:  # pragma: no cover - non-Windows machines
     ZPL_WINDOWS = False
 
 # The legacy image path additionally needs win32ui/win32con/win32gui + PIL.
@@ -83,8 +96,20 @@ try:
     from PIL import Image, ImageWin
 
     IMAGE_WINDOWS = True
-except Exception:  # pragma: no cover - non-Windows dev machines
+except Exception:  # pragma: no cover - non-Windows machines
     IMAGE_WINDOWS = False
+
+# USB path (Android/Termux). pyusb imports fine without the libusb runtime
+# library; the backend only fails when actually used, which we surface clearly.
+try:
+    import usb.core
+    import usb.util
+
+    USB_PYUSB = True
+except Exception:  # pragma: no cover - USB lib not installed
+    USB_PYUSB = False
+
+LOG = logging.getLogger("sgn-print-bridge")
 
 app = FastAPI(title="SGN Token Print Bridge", version="1.1.0")
 # Allow the browser (any origin, since this is a localhost-only helper) to call us.
@@ -99,13 +124,92 @@ app.add_middleware(
 # --- Configuration -------------------------------------------------------
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join(os.getcwd(), "sgn-prints"))
 PRINTER_NAME = os.environ.get("PRINTER_NAME", "")
-PRINTER_HOST = os.environ.get("PRINTER_HOST", "")
+PRINTER_IP = os.environ.get("PRINTER_IP") or os.environ.get("PRINTER_HOST") or ""
 PRINTER_PORT = int(os.environ.get("PRINTER_PORT", "9100"))
 PRINTER_DPI = int(os.environ.get("PRINTER_DPI", "203"))
 ZPL_WIDTH_MM = int(os.environ.get("ZPL_WIDTH_MM", "50"))
 ZPL_HEIGHT_MM = int(os.environ.get("ZPL_HEIGHT_MM", "25"))
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+# --- Platform detection & send-path selection ---------------------------
+# The bridge runs on three kinds of host (Windows PC, Sunmi T2s Lite/Termux,
+# generic Linux) and each has its own printer transport. The transport is
+# picked from real platform signals (OS + Termux markers), never from which
+# env vars happen to be set - PRINTER_NAME is only consulted on platforms
+# where win32print/CUPS actually exist, so a PRINTER_NAME value copied to the
+# Sunmi cannot route it to a nonexistent CUPS queue. PRINTER_IP is honoured
+# everywhere so the future TCP 9100 network fallback overrides on any host.
+ZEBRA_USB_VID = 0x0A5F
+USB_WRITE_TIMEOUT_MS = 5000
+
+
+def detect_platform(system=None, prefix=None, data_dir="/data/data/com.termux") -> str:
+    """Classify the host: 'windows', 'android' (Termux) or 'linux'.
+
+    Termux always exports PREFIX (e.g. /data/data/com.termux/files/usr) and
+    creates /data/data/com.termux on disk - either signal alone is conclusive.
+    """
+    if system is None:
+        system = platform.system()
+    if prefix is None:
+        prefix = os.environ.get("PREFIX", "")
+    if system == "Windows":
+        return "windows"
+    if "com.termux" in prefix:
+        return "android"
+    if system == "Linux" and os.path.isdir(data_dir):
+        return "android"
+    return "linux"
+
+
+PLATFORM = detect_platform()
+PLATFORM_LABEL = {
+    "windows": "Windows",
+    "android": "Android/Termux",
+    "linux": "Linux",
+}[PLATFORM]
+
+BACKEND_LABEL = {
+    "socket": "TCP 9100",
+    "win32print": "Windows win32print",
+    "cups": "CUPS (lp)",
+    "usb": "USB (pyusb)",
+    "none": "none",
+}
+
+
+def select_backend(platform_: str | None = None) -> str:
+    """Choose the active send path for `platform_` (defaults to PLATFORM)."""
+    platform_ = platform_ or PLATFORM
+    if PRINTER_IP:
+        return "socket"
+    if platform_ == "android":
+        # Termux has no CUPS/win32print - USB is the only local transport and
+        # PRINTER_NAME is never relevant here, even if it happens to be set.
+        return "usb"
+    if platform_ == "windows":
+        if ZPL_WINDOWS and PRINTER_NAME:
+            return "win32print"
+        if PRINTER_NAME and shutil.which("lp"):
+            return "cups"
+        return "none"
+    # Generic Linux (incl. the dev box): CUPS when a queue is configured.
+    if PRINTER_NAME and shutil.which("lp"):
+        return "cups"
+    return "none"
+
+
+BACKEND = select_backend()
+
+BANNER = (
+    f"Detected platform: {PLATFORM_LABEL} (os={platform.system()}, "
+    f"PREFIX={os.environ.get('PREFIX', '') or '(unset)'}) - "
+    f"send path: {BACKEND_LABEL[BACKEND]}"
+)
+print(f"[sgn-print-bridge] {BANNER}", flush=True)
+LOG.info(BANNER)
 
 
 # --- ZPL helpers ---------------------------------------------------------
@@ -302,16 +406,25 @@ def print_zpl_win32(zpl: bytes, copies: int = 1) -> None:
     if not ZPL_WINDOWS:
         raise RuntimeError("win32print not available on this machine.")
     if not PRINTER_NAME:
-        raise RuntimeError("PRINTER_NAME is not set.")
+        raise RuntimeError("Windows printer queue name not set (PRINTER_NAME).")
 
     ensure_win32_printer_ready(PRINTER_NAME)
 
-    hprinter = win32print.OpenPrinter(PRINTER_NAME)
+    try:
+        hprinter = win32print.OpenPrinter(PRINTER_NAME)
+    except Exception as exc:  # noqa: BLE001 - queue missing / not reachable
+        raise RuntimeError(
+            f"Windows printer queue '{PRINTER_NAME}' not found or inaccessible: {exc}"
+        ) from exc
     try:
         win32print.StartDocPrinter(hprinter, 1, ("SGN Token", None, "RAW"))
         try:
             for _ in range(max(1, copies)):
-                win32print.WritePrinter(hprinter, zpl)
+                written = win32print.WritePrinter(hprinter, zpl)
+                if written != len(zpl):
+                    raise RuntimeError(
+                        f"Windows printer write incomplete: sent {written} of {len(zpl)} bytes"
+                    )
         finally:
             win32print.EndDocPrinter(hprinter)
     finally:
@@ -320,12 +433,30 @@ def print_zpl_win32(zpl: bytes, copies: int = 1) -> None:
 
 def print_zpl_socket(zpl: bytes, copies: int = 1) -> None:
     """Send raw ZPL to a networked Zebra over its native port 9100."""
-    if not PRINTER_HOST:
-        raise RuntimeError("PRINTER_HOST is not set.")
+    if not PRINTER_IP:
+        raise RuntimeError("PRINTER_IP is not set.")
 
-    with socket.create_connection((PRINTER_HOST, PRINTER_PORT), timeout=5) as sock:
-        for _ in range(max(1, copies)):
-            sock.sendall(zpl)
+    try:
+        with socket.create_connection((PRINTER_IP, PRINTER_PORT), timeout=5) as sock:
+            for _ in range(max(1, copies)):
+                sock.sendall(zpl)
+    except OSError as exc:
+        raise RuntimeError(
+            f"TCP send to printer {PRINTER_IP}:{PRINTER_PORT} failed: {exc} - "
+            "is the ZD230 powered on and reachable on the network?"
+        ) from exc
+
+
+def socket_readiness() -> tuple[bool, str]:
+    """(ok, detail) for the TCP 9100 path - is the printer reachable right now?"""
+    if not PRINTER_IP:
+        return False, "PRINTER_IP not set"
+    try:
+        with socket.create_connection((PRINTER_IP, PRINTER_PORT), timeout=2):
+            pass
+    except OSError as exc:
+        return False, f"TCP {PRINTER_IP}:{PRINTER_PORT} unreachable: {exc}"
+    return True, f"TCP {PRINTER_IP}:{PRINTER_PORT} reachable"
 
 
 def cups_printer_status(printer: str) -> str:
@@ -379,7 +510,7 @@ def verify_cups_job(lp_output: str, timeout: float = 15.0) -> None:
     """
     match = re.search(r"request id is (\S+)", lp_output)
     if not match:
-        return
+        raise RuntimeError("CUPS did not accept the job (no request id reported by lp)")
     job_id = match.group(1)
     lpstat = shutil.which("lpstat") or "lpstat"
     deadline = time.monotonic() + timeout
@@ -405,9 +536,9 @@ def print_zpl_cups(zpl: bytes, copies: int = 1) -> None:
     """
     lp = shutil.which("lp")
     if not lp:
-        raise RuntimeError("'lp' (CUPS) not found on this machine.")
+        raise RuntimeError("CUPS 'lp' is not installed on this machine.")
     if not PRINTER_NAME:
-        raise RuntimeError("PRINTER_NAME is not set.")
+        raise RuntimeError("CUPS queue name not set (PRINTER_NAME).")
 
     ok, why = cups_printer_ready(PRINTER_NAME)
     if not ok:
@@ -425,6 +556,175 @@ def print_zpl_cups(zpl: bytes, copies: int = 1) -> None:
             detail = proc.stderr.decode(errors="replace").strip()
             raise RuntimeError(detail or f"lp command failed (exit {proc.returncode})")
         verify_cups_job(proc.stdout.decode(errors="replace"))
+
+
+def cups_readiness() -> tuple[bool, str]:
+    """(ok, detail) for the CUPS path - does the queue exist and reach the printer?"""
+    if not shutil.which("lp"):
+        return False, "CUPS 'lp' is not installed on this machine"
+    if not PRINTER_NAME:
+        return False, "CUPS queue name not set (PRINTER_NAME)"
+    ok, why = cups_printer_ready(PRINTER_NAME)
+    if ok:
+        return True, f"CUPS queue '{PRINTER_NAME}' ready ({why})"
+    return False, f"CUPS queue '{PRINTER_NAME}' not ready: {why}"
+
+
+# --- USB (pyusb / Termux) ------------------------------------------------
+def termux_usb_devices() -> list[tuple[str, int, int, str]]:
+    """Run `termux-usb -l` and parse the connected devices.
+
+    Returns [(device_token, vid, pid, raw_line), ...]. Raises RuntimeError when
+    termux-usb is missing or exits non-zero.
+    """
+    termux_usb = shutil.which("termux-usb")
+    if not termux_usb:
+        raise RuntimeError(
+            "termux-usb not found - install the Termux:API add-on (pkg install termux-api)"
+        )
+    proc = subprocess.run(
+        [termux_usb, "-l"], capture_output=True, text=True, timeout=10, check=False
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"termux-usb -l failed (exit {proc.returncode})")
+    devices: list[tuple[str, int, int, str]] = []
+    for line in proc.stdout.splitlines():
+        m = re.search(r"\b(?:0x)?([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\b", line)
+        if not m:
+            continue
+        vid, pid = int(m.group(1), 16), int(m.group(2), 16)
+        devices.append((line.split()[0], vid, pid, line.strip()))
+    return devices
+
+
+def termux_usb_find_zebra() -> tuple[str, int, str] | None:
+    """First Zebra device (vendor 0x0A5F) listed by termux-usb, or None."""
+    for token, vid, pid, line in termux_usb_devices():
+        if vid == ZEBRA_USB_VID:
+            return token, pid, line
+    return None
+
+
+def grant_termux_usb_permission() -> None:
+    """Best-effort request of Android USB permission for the Zebra device.
+
+    Triggers the Termux:API permission dialog so pyusb can open the device.
+    Non-fatal when it fails - pyusb reports the real error afterwards.
+    """
+    if not shutil.which("termux-usb"):
+        return
+    try:
+        found = termux_usb_find_zebra()
+    except Exception:  # noqa: BLE001 - probe problems reported by pyusb later
+        return
+    if found:
+        token, _, _ = found
+        subprocess.run(
+            ["termux-usb", "-r", token], capture_output=True, timeout=10, check=False
+        )
+
+
+def usb_readiness() -> tuple[bool, str]:
+    """(ok, detail) for the USB path - device found AND usable right now."""
+    if not USB_PYUSB:
+        return (
+            False,
+            "pyusb is not installed - pip install pyusb (on Termux also: pkg install libusb)",
+        )
+    termux_seen = None
+    if shutil.which("termux-usb"):
+        try:
+            termux_seen = termux_usb_find_zebra()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"termux-usb probe failed: {exc}"
+    try:
+        dev = usb.core.find(idVendor=ZEBRA_USB_VID)
+    except usb.core.NoBackendError:
+        return (
+            False,
+            "pyusb installed but no libusb backend - install libusb "
+            "(on Termux: pkg install libusb; on Debian/Ubuntu: apt install libusb-1.0-0)",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"pyusb enumeration failed: {exc}"
+    if dev is None:
+        if termux_seen:
+            return (
+                False,
+                "Zebra ZD230 is listed by termux-usb but not usable by pyusb - run "
+                "'termux-usb -r <device>' to grant permission, or start Termux as root",
+            )
+        return (
+            False,
+            "Zebra ZD230 (vendor 0x0A5F) not found on USB - check the OTG cable "
+            "and that the printer is powered on",
+        )
+    return True, "Zebra ZD230 detected on USB (permission granted)"
+
+
+def print_zpl_usb(zpl: bytes, copies: int = 1) -> None:
+    """Send raw ZPL to a USB-attached Zebra via pyusb (Android/Termux)."""
+    if not USB_PYUSB:
+        raise RuntimeError(
+            "USB print path requires pyusb - pip install pyusb (on Termux also: "
+            "pkg install libusb)"
+        )
+    grant_termux_usb_permission()
+    try:
+        dev = usb.core.find(idVendor=ZEBRA_USB_VID)
+    except usb.core.NoBackendError:
+        raise RuntimeError(
+            "USB print path has no libusb backend - install libusb "
+            "(on Termux: pkg install libusb)"
+        ) from None
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"USB device lookup failed: {exc}") from exc
+    if dev is None:
+        raise RuntimeError(
+            "USB write failed: Zebra ZD230 (vendor 0x0A5F) not found - is it powered "
+            "on and plugged into the OTG adapter?"
+        )
+
+    ep_out = None
+    intf = None
+    try:
+        dev.set_configuration()
+        cfg = dev.get_active_configuration()
+        for candidate in cfg:
+            if candidate.bInterfaceClass == 7:  # printer class
+                intf = candidate
+                break
+        if intf is None:
+            intf = cfg[(0, 0)]
+        for ep in intf:
+            if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT:
+                ep_out = ep
+                break
+        if ep_out is None:
+            raise RuntimeError("USB write failed: no OUT endpoint found on the ZD230")
+        usb.util.claim_interface(dev, intf)
+        for _ in range(max(1, copies)):
+            written = ep_out.write(zpl, timeout=USB_WRITE_TIMEOUT_MS)
+            if written != len(zpl):
+                raise RuntimeError(
+                    f"USB write incomplete: sent {written} of {len(zpl)} bytes"
+                )
+    except usb.core.USBError as exc:
+        err = str(exc).lower()
+        if "access" in err or "permission" in err:
+            raise RuntimeError(
+                "USB permission denied - run 'termux-usb -r <device>' to grant access, "
+                "or start Termux as root"
+            ) from exc
+        if "no device" in err or "disconnect" in err:
+            raise RuntimeError("USB write failed: the ZD230 was disconnected mid-print") from exc
+        raise RuntimeError(f"USB write failed: {exc}") from exc
+    finally:
+        if intf is not None:
+            try:
+                usb.util.release_interface(dev, intf)
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                pass
 
 
 # --- Legacy image path (unchanged behaviour) -----------------------------
@@ -464,25 +764,47 @@ def print_image(image_path: str, printer_name: str, copies: int = 1) -> None:
 
 
 # --- Routes ---------------------------------------------------------------
+def win32print_readiness() -> tuple[bool, str]:
+    """(ok, detail) for the Windows win32print path - queue exists and is ready."""
+    if not ZPL_WINDOWS:
+        return False, "pywin32 is not available on this platform"
+    if not PRINTER_NAME:
+        return False, "Windows printer queue name not set (PRINTER_NAME)"
+    try:
+        ensure_win32_printer_ready(PRINTER_NAME)
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return True, f"Windows queue '{PRINTER_NAME}' ready"
+
+
+def readiness_for_backend(backend: str) -> tuple[bool, str]:
+    """Live readiness probe for the currently active send path."""
+    if backend == "socket":
+        return socket_readiness()
+    if backend == "win32print":
+        return win32print_readiness()
+    if backend == "cups":
+        return cups_readiness()
+    if backend == "usb":
+        return usb_readiness()
+    return False, "no send path configured for this platform"
+
+
 @app.get("/health")
 def health():
     lp_available = bool(shutil.which("lp"))
     cups_status = cups_printer_status(PRINTER_NAME) if (PRINTER_NAME and lp_available) else ""
     return {
         "ok": True,
+        "platform": PLATFORM,
+        "platform_detail": PLATFORM_LABEL,
         "printer": PRINTER_NAME,
-        "printer_host": PRINTER_HOST or None,
-        "backend": (
-            "socket"
-            if PRINTER_HOST
-            else "win32print"
-            if (PRINTER_NAME and ZPL_WINDOWS)
-            else "cups-lp"
-            if (PRINTER_NAME and lp_available)
-            else "none"
-        ),
+        "printer_ip": PRINTER_IP or None,
+        "backend": BACKEND,
+        "backend_label": BACKEND_LABEL[BACKEND],
         "zpl_windows": ZPL_WINDOWS,
         "image_windows": IMAGE_WINDOWS,
+        "usb_pyusb": USB_PYUSB,
         "lp_available": lp_available,
         "cups_status": cups_status,
         "cups_printer_ready": not (
@@ -490,6 +812,39 @@ def health():
         ),
         "label_mm": [ZPL_WIDTH_MM, ZPL_HEIGHT_MM],
         "dpi": PRINTER_DPI,
+    }
+
+
+@app.get("/api/print/diagnostics")
+def print_diagnostics():
+    """One-request report: platform, active send path, and a live readiness
+    probe so "will this bridge actually print right now" is a single call."""
+    checks = {}
+    if PLATFORM == "android" or USB_PYUSB:
+        ok, detail = usb_readiness()
+        checks["usb"] = {"ready": ok, "detail": detail}
+    if ZPL_WINDOWS:
+        ok, detail = win32print_readiness()
+        checks["win32print"] = {"ready": ok, "detail": detail}
+    if shutil.which("lp"):
+        ok, detail = cups_readiness()
+        checks["cups"] = {"ready": ok, "detail": detail}
+    if PRINTER_IP:
+        ok, detail = socket_readiness()
+        checks["socket"] = {"ready": ok, "detail": detail}
+
+    active_ok, active_detail = readiness_for_backend(BACKEND)
+    return {
+        "ok": True,
+        "platform": PLATFORM,
+        "platform_detail": PLATFORM_LABEL,
+        "backend": BACKEND,
+        "backend_label": BACKEND_LABEL[BACKEND],
+        "backend_ready": active_ok,
+        "backend_detail": active_detail,
+        "printer_name": PRINTER_NAME or None,
+        "printer_ip": PRINTER_IP or None,
+        "checks": checks,
     }
 
 
@@ -513,27 +868,30 @@ def print_zpl_api(payload: ZplRequest):
         zpl = build_token_zpl(payload.hospital, payload.token_number).encode("ascii", errors="replace")
 
     try:
-        if PRINTER_HOST:
+        if BACKEND == "socket":
             print_zpl_socket(zpl, copies=copies)
-            backend = "socket"
-        elif PRINTER_NAME and ZPL_WINDOWS:
+        elif BACKEND == "win32print":
             print_zpl_win32(zpl, copies=copies)
-            backend = "win32print"
-        elif PRINTER_NAME:
+        elif BACKEND == "cups":
             print_zpl_cups(zpl, copies=copies)
-            backend = "cups-lp"
+        elif BACKEND == "usb":
+            print_zpl_usb(zpl, copies=copies)
         else:
             raise HTTPException(
                 status_code=500,
-                detail="Set PRINTER_NAME (CUPS queue name on Linux, e.g. ZTC-ZD230-203dpi-ZPL, "
-                "or the Windows ZPL driver queue) - or PRINTER_HOST for a networked ZD230.",
+                detail=(
+                    f"No print backend is configured for platform {PLATFORM_LABEL}. "
+                    "On Windows set PRINTER_NAME to the ZD230 queue; on Android/Termux "
+                    "connect the ZD230 over USB (pyusb); or set PRINTER_IP to force "
+                    "the TCP 9100 path on any machine."
+                ),
             )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return {"ok": True, "copies": copies, "backend": backend}
+    return {"ok": True, "copies": copies, "backend": BACKEND}
 
 
 @app.post("/api/print/")
