@@ -36,6 +36,12 @@ you can tell the ZD230 from a hub/controller - run against each termux-usb -l
 path):
     termux-usb -r -e "$PREFIX/bin/python send_test.py token4.zpl --dry-run" /dev/bus/usb/001/005
 
+Quick identification only (wrap + VID/PID + string descriptors, then stop
+before any write - the same granted fd, no second context/bus enumeration):
+    termux-usb -r -e "$PREFIX/bin/python send_test.py token4.zpl --identify-only" /dev/bus/usb/001/005
+    termux-usb -r -e "$PREFIX/bin/python send_test.py token4.zpl --identify-only" /dev/bus/usb/001/007
+The path printing "Vendor ID: 0xa5f" is the ZD230 (Zebra); the other is the hub.
+
 The bridge (app.py) shells out to exactly this script via
 `termux-usb -r -e ...` when a print job arrives.
 """
@@ -139,8 +145,26 @@ def _dbg(msg: str) -> None:
     print(f"[usb-worker] {msg}", file=sys.stderr)
 
 
+def _log_device_identity(dev: object, handle: object) -> None:
+    """Identify the wrapped device using the SAME handle - never a new
+    context or a second fd (Termux blocks unsandboxed bus enumeration)."""
+    _dbg(f"Vendor ID:  {hex(dev.getVendorID())}")
+    _dbg(f"Product ID: {hex(dev.getProductID())}")
+    try:
+        _dbg(f"Manufacturer: {handle.getManufacturer()}")
+        _dbg(f"Product:      {handle.getProduct()}")
+        _dbg(f"Serial:       {handle.getSerialNumber()}")
+    except Exception as exc:  # noqa: BLE001 - string descriptors are optional
+        _dbg(f"(string descriptors unavailable: {exc})")
+
+
 def write_zpl(
-    zpl: bytes, copies: int, fd: int, dry_run: bool = False, skip_vid_check: bool = False
+    zpl: bytes,
+    copies: int,
+    fd: int,
+    dry_run: bool = False,
+    skip_vid_check: bool = False,
+    identify_only: bool = False,
 ) -> None:
     """Wrap the granted fd and write the label; raises on the failing step."""
     import usb1
@@ -174,6 +198,12 @@ def write_zpl(
 
             vid, pid = dev.getVendorID(), dev.getProductID()
             _dbg(f"wrapped device: VID 0x{vid:04X} PID 0x{pid:04X}")
+            _log_device_identity(dev, handle)
+
+            if identify_only:
+                _dbg("identify-only: device identified, no write performed")
+                return
+
             _enumerate(dev, handle)  # dump before deciding, so --dry-run identifies any device
 
             if dry_run:
@@ -314,12 +344,26 @@ def _run() -> None:
         help="diagnostic: attempt the write even when the device VID is not Zebra "
         "0x0A5F (e.g. to debug the write/retry path on a test device)",
     )
+    ap.add_argument(
+        "--identify-only",
+        action="store_true",
+        help="wrap the granted fd, log VID/PID + string descriptors from that "
+        "same handle, then stop before any write - use to confirm which "
+        "/dev/bus/usb/... path is the ZD230 (VID 0x0A5F)",
+    )
     args, extra = ap.parse_known_args()
 
     fd = resolve_fd(args, extra)
     with open(args.zpl_file, "rb") as fh:
         zpl = fh.read()
-    write_zpl(zpl, args.copies, fd, dry_run=args.dry_run, skip_vid_check=args.skip_vid_check)
+    write_zpl(
+        zpl,
+        args.copies,
+        fd,
+        dry_run=args.dry_run,
+        skip_vid_check=args.skip_vid_check,
+        identify_only=args.identify_only,
+    )
 
 
 def main() -> None:
