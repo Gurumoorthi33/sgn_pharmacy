@@ -1,2 +1,3 @@
-termux-usb -r -e ".venv/bin/python send_test.py token4.zpl --identify-only" /dev/bus/usb/001/005
-termux-usb -r -e ".venv/bin/python send_test.py token4.zpl --identify-only" /dev/bus/usb/001/007
+
+termux-usb -r -e ".venv/bin/python send_test.py --identify-only" /dev/bus/usb/001/005
+termux-usb -r -e ".venv/bin/python send_test.py --identify-only" /dev/bus/usb/001/007

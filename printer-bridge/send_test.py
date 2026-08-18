@@ -37,9 +37,10 @@ path):
     termux-usb -r -e "$PREFIX/bin/python send_test.py token4.zpl --dry-run" /dev/bus/usb/001/005
 
 Quick identification only (wrap + VID/PID + string descriptors, then stop
-before any write - the same granted fd, no second context/bus enumeration):
-    termux-usb -r -e "$PREFIX/bin/python send_test.py token4.zpl --identify-only" /dev/bus/usb/001/005
-    termux-usb -r -e "$PREFIX/bin/python send_test.py token4.zpl --identify-only" /dev/bus/usb/001/007
+before any write - the same granted fd, no second context/bus enumeration; no
+zpl file is needed):
+    termux-usb -r -e "$PREFIX/bin/python send_test.py --identify-only" /dev/bus/usb/001/005
+    termux-usb -r -e "$PREFIX/bin/python send_test.py --identify-only" /dev/bus/usb/001/007
 The path printing "Vendor ID: 0xa5f" is the ZD230 (Zebra); the other is the hub.
 
 The bridge (app.py) shells out to exactly this script via
@@ -324,7 +325,7 @@ def _run() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("zpl_file", help="path to the raw ZPL to send")
+    ap.add_argument("zpl_file", nargs="?", default=None, help="path to the raw ZPL to send")
     ap.add_argument("--copies", type=int, default=1, help="how many labels (default 1)")
     ap.add_argument(
         "--fd",
@@ -353,9 +354,18 @@ def _run() -> None:
     )
     args, extra = ap.parse_known_args()
 
+    if args.zpl_file is not None and args.zpl_file.isdigit() and args.fd is None:
+        extra.append(args.zpl_file)
+        args.zpl_file = None
+
+    if args.zpl_file is None and not args.identify_only:
+        ap.error("zpl_file is required unless --identify-only is used")
+
     fd = resolve_fd(args, extra)
-    with open(args.zpl_file, "rb") as fh:
-        zpl = fh.read()
+    zpl = b""
+    if args.zpl_file is not None:
+        with open(args.zpl_file, "rb") as fh:
+            zpl = fh.read()
     write_zpl(
         zpl,
         args.copies,
