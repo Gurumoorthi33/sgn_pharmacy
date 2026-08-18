@@ -87,6 +87,11 @@ def _find_out_bulk(dev):
     raise RuntimeError("no OUT bulk endpoint found on the wrapped device")
 
 
+def _dbg(msg: str) -> None:
+    """Step log - to stderr so stdout stays clean for the OK marker."""
+    print(f"[usb-worker] {msg}", file=sys.stderr)
+
+
 def write_zpl(zpl: bytes, copies: int, fd: int) -> None:
     """Wrap the granted fd and write the label; raises on the failing step."""
     import usb1
@@ -98,6 +103,7 @@ def write_zpl(zpl: bytes, copies: int, fd: int) -> None:
             "pkg upgrade libusb" % (ver.major, ver.minor, ver.micro)
         )
 
+    _dbg(f"fd obtained: {fd}")
     with usb1.USBContext() as ctx:
         handle = None
         try:
@@ -107,6 +113,7 @@ def write_zpl(zpl: bytes, copies: int, fd: int) -> None:
                 raise RuntimeError(
                     f"device wrap failed (wrapSysDevice): {_usb_error(exc)}"
                 ) from exc
+            _dbg("device wrapped (wrapSysDevice)")
 
             try:
                 dev = handle.getDevice()
@@ -116,6 +123,7 @@ def write_zpl(zpl: bytes, copies: int, fd: int) -> None:
                 ) from exc
 
             vid, pid = dev.getVendorID(), dev.getProductID()
+            _dbg(f"wrapped device: VID 0x{vid:04X} PID 0x{pid:04X}")
             if vid != ZEBRA_USB_VID:
                 raise RuntimeError(
                     "wrapped device is not a Zebra (VID 0x%04X PID 0x%04X) - "
@@ -124,6 +132,7 @@ def write_zpl(zpl: bytes, copies: int, fd: int) -> None:
                 )
 
             ep, intf = _find_out_bulk(dev)
+            _dbg(f"endpoint 0x{ep:02X} on interface {intf}")
             try:
                 handle.setAutoDetachKernelDriver(True)
             except usb1.USBError:
@@ -135,9 +144,11 @@ def write_zpl(zpl: bytes, copies: int, fd: int) -> None:
                 raise RuntimeError(
                     f"interface claim failed (claimInterface({intf})): {_usb_error(exc)}"
                 ) from exc
+            _dbg(f"interface {intf} claimed")
 
             total = len(zpl) * max(1, copies)
             for i in range(1, max(1, copies) + 1):
+                _dbg(f"write attempted: copy {i}/{max(1, copies)}, {len(zpl)} bytes")
                 try:
                     n = handle.bulkWrite(ep, zpl, timeout=USB_WRITE_TIMEOUT_MS)
                 except usb1.USBError as exc:
@@ -149,6 +160,7 @@ def write_zpl(zpl: bytes, copies: int, fd: int) -> None:
                     raise RuntimeError(
                         f"write incomplete (bulkWrite sent {n} of {len(zpl)} bytes)"
                     )
+                _dbg(f"bytes written: {n}/{len(zpl)} (copy {i}/{max(1, copies)})")
             print(f"OK ZEBRA-USB WROTE {max(1, copies)} COPIES, {total} BYTES")
         finally:
             if handle is not None:

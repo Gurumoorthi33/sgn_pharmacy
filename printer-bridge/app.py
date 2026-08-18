@@ -127,6 +127,16 @@ USB_TERMUX_DIALOG_TIMEOUT_S = 90
 SEND_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "send_test.py")
 
 LOG = logging.getLogger("sgn-print-bridge")
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+)
+LOG.addHandler(_log_handler)
+LOG.setLevel(logging.INFO)
+# Own handler + propagate=False so uvicorn's root-logger config (default root
+# level is WARNING) can never swallow our INFO step logs or hide tracebacks -
+# every print backend failure is always visible in the server log.
+LOG.propagate = False
 
 app = FastAPI(title="SGN Token Print Bridge", version="1.1.0")
 # Allow the browser (any origin, since this is a localhost-only helper) to call us.
@@ -226,7 +236,6 @@ BANNER = (
     f"PREFIX={os.environ.get('PREFIX', '') or '(unset)'}) - "
     f"send path: {BACKEND_LABEL[BACKEND]}"
 )
-print(f"[sgn-print-bridge] {BANNER}", flush=True)
 LOG.info(BANNER)
 
 
@@ -708,6 +717,7 @@ def print_zpl_usb(zpl: bytes, copies: int = 1) -> None:
     device = resolve_usb_target()
     if not os.path.isfile(SEND_WORKER):
         raise RuntimeError(f"USB worker script missing: {SEND_WORKER}")
+    LOG.info("usb: target device %s, %d bytes of ZPL", device, len(zpl))
 
     fd_path = None
     try:
@@ -720,6 +730,12 @@ def print_zpl_usb(zpl: bytes, copies: int = 1) -> None:
             shlex.quote(a)
             for a in [sys.executable, SEND_WORKER, fd_path, "--copies", str(copies)]
         )
+        LOG.info(
+            "usb: running termux-usb -r -e %r %s (worker grants a fresh fd for "
+            "this job; already-granted permission should not re-prompt)",
+            command,
+            device,
+        )
         try:
             proc = subprocess.run(
                 [termux_usb, "-r", "-e", command, device],
@@ -728,6 +744,10 @@ def print_zpl_usb(zpl: bytes, copies: int = 1) -> None:
                 timeout=USB_TERMUX_DIALOG_TIMEOUT_S,
             )
         except subprocess.TimeoutExpired:
+            LOG.error(
+                "usb: termux-usb timed out after %ss (permission dialog? dead ZD230?)",
+                USB_TERMUX_DIALOG_TIMEOUT_S,
+            )
             raise RuntimeError(
                 f"USB print timed out after {USB_TERMUX_DIALOG_TIMEOUT_S}s - "
                 "termux-usb may be stuck on the Android permission dialog or the "
@@ -743,11 +763,20 @@ def print_zpl_usb(zpl: bytes, copies: int = 1) -> None:
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
     if proc.returncode != 0 or "OK ZEBRA-USB" not in out:
+        LOG.error(
+            "usb: worker exit=%d stdout=%r stderr=%r",
+            proc.returncode,
+            out[-2000:],
+            err[-4000:],
+        )
         raise RuntimeError(
             "USB write failed (worker exit {}): {}".format(
                 proc.returncode, err or out or "no output from termux-usb"
             )
         )
+    LOG.info("usb: confirmed write -> %s", out)
+    if err:
+        LOG.debug("usb: worker stderr: %s", err)
 
 
 # --- Legacy image path (unchanged behaviour) -----------------------------
@@ -914,7 +943,14 @@ def print_zpl_api(payload: ZplRequest):
             )
     except HTTPException:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - always surface, never silently swallow
+        LOG.exception(
+            "print backend '%s' failed for token_number=%s copies=%s (zpl=%d bytes)",
+            BACKEND,
+            payload.token_number,
+            payload.copies,
+            len(zpl),
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {"ok": True, "copies": copies, "backend": BACKEND}
