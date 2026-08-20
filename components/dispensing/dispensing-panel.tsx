@@ -2,15 +2,12 @@
 
 import { useRef, useState, useTransition } from "react"
 import { generateTokenAction } from "@/app/dispensing/actions"
-import { TokenLabel } from "@/components/dispensing/token-label"
 import { sendToPrintBridge, printLabelsViaIframe, PRINT_BRIDGE_URL, PrintBridgeError } from "@/lib/print-bridge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { HOSPITAL_SHORT, type Token } from "@/lib/types"
-import { Printer, Ticket } from "lucide-react"
+import { HOSPITAL_SHORT } from "@/lib/types"
+import { Printer } from "lucide-react"
 
 export function DispensingPanel({ initialCount }: { initialCount: number }) {
-  const [current, setCurrent] = useState<Token | null>(null)
   const [issuedToday, setIssuedToday] = useState(initialCount)
   const [error, setError] = useState<string | null>(null)
   const [pending, startTransition] = useTransition()
@@ -65,7 +62,6 @@ export function DispensingPanel({ initialCount }: { initialCount: number }) {
         return
       }
       const token = res.token
-      setCurrent(token)
       setIssuedToday((c) => c + 1)
       // Allow the DOM to paint the new labels first, then print.
       setTimeout(() => printToken(token.token_number), 200)
@@ -73,75 +69,37 @@ export function DispensingPanel({ initialCount }: { initialCount: number }) {
   }
 
   return (
-    <div className="mx-auto grid w-full max-w-5xl gap-6 p-6 lg:grid-cols-[1.1fr_1fr]">
-      {/* Controls */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Ticket className="h-5 w-5 text-primary" aria-hidden="true" />
-            Generate patient token
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-5">
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            Pressing the button issues the next token and prints it automatically on the Zebra ZD230 &mdash; the same
-            token number is printed twice (one for the patient, one for the prescription bag).
+    <div className="flex min-h-[calc(100vh-72px)] items-center justify-center px-6 py-10">
+      <div className="flex w-full max-w-5xl flex-col items-center justify-center gap-8 text-center">
+        <div className="flex flex-col items-center gap-3 rounded-3xl bg-white/70 px-8 py-7 shadow-sm ring-1 ring-border backdrop-blur-sm sm:px-12 lg:px-16">
+          <span className="text-xl font-semibold uppercase tracking-[0.2em] text-muted-foreground sm:text-2xl">
+            Tokens issued today
+          </span>
+          <span className="font-mono text-6xl font-black leading-none tracking-tight text-foreground md:text-8xl">
+            {issuedToday}
+          </span>
+        </div>
+
+        <Button
+          className="w-full max-w-3xl rounded-2xl px-8 py-8 text-xl font-bold sm:text-2xl md:text-3xl"
+          size="lg"
+          disabled={pending}
+          onClick={handleGenerate}
+        >
+          <Printer className="mr-3 h-6 w-6 shrink-0 sm:h-7 sm:w-7" aria-hidden="true" />
+          {pending ? "Generating..." : "Generate & Print Token"}
+        </Button>
+
+        {error ? (
+          <p
+            className="max-w-3xl rounded-2xl bg-destructive/10 px-5 py-4 text-base font-medium text-destructive sm:text-lg"
+            role="alert"
+            aria-live="polite"
+          >
+            {error}
           </p>
-
-          <div className="flex items-baseline justify-between rounded-lg bg-secondary px-4 py-3">
-            <span className="text-sm font-medium text-secondary-foreground">Tokens issued today</span>
-            <span className="font-mono text-2xl font-bold text-foreground">{issuedToday}</span>
-          </div>
-
-          <Button className="w-full" size="lg" disabled={pending} onClick={handleGenerate}>
-            <Printer className="mr-2 h-5 w-5" aria-hidden="true" />
-            {pending ? "Generating..." : "Generate & Print Token"}
-          </Button>
-
-          {current ? (
-            <Button
-              variant="outline"
-              className="self-start bg-transparent"
-              onClick={() => printToken(current.token_number)}
-            >
-              <Printer className="mr-2 h-4 w-4" aria-hidden="true" />
-              Reprint token {current.token_number}
-            </Button>
-          ) : null}
-
-          {error ? (
-            <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" role="alert">
-              {error}
-            </p>
-          ) : null}
-
-          <p className="rounded-md bg-accent/40 px-3 py-2 text-xs leading-relaxed text-accent-foreground">
-            Tip: to skip the print dialog entirely, launch Chrome with{" "}
-            <code className="font-mono">--kiosk-printing</code> so tokens print silently on the ZD230. If the
-            bridge is down, start it on the printer PC: <code className="font-mono">cd printer-bridge && python app.py</code>,
-            then check <code className="font-mono">http://localhost:5000/health</code>.
-          </p>
-        </CardContent>
-      </Card>
-
-      {/* Preview */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Label preview</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {current ? (
-            <div className="label-preview flex flex-wrap items-center justify-center gap-4">
-              <TokenLabel tokenNumber={current.token_number} />
-              <TokenLabel tokenNumber={current.token_number} />
-            </div>
-          ) : (
-            <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border text-sm text-muted-foreground">
-              Generate a token to preview the labels
-            </div>
-          )}
-        </CardContent>
-      </Card>
+        ) : null}
+      </div>
     </div>
   )
 }

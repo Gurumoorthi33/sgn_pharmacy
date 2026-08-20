@@ -15,7 +15,7 @@ export default async function DispensingPage() {
 
   return (
     <div className="min-h-screen bg-secondary">
-      <StationHeader title="Dispensing Station" subtitle="Token generation & label printing" fullName={fullName} />
+      <StationHeader title="Dispensing Station" fullName={fullName} />
       <DispensingPanel initialCount={count ?? 0} />
     </div>
   )
