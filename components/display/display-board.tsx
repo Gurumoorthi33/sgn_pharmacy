@@ -44,7 +44,7 @@ export function DisplayBoard() {
   const supabase = useMemo(() => createClient(), [])
   const [rows, setRows] = useState<DisplayRow[]>([])
   const [lang, setLang] = useState<Lang>("en")
-  const [now, setNow] = useState<Date>(new Date())
+  const [now, setNow] = useState<Date | null>(null)
   const [soundOn, setSoundOn] = useState(false)
   const lastDispatchCallRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
@@ -77,11 +77,41 @@ export function DisplayBoard() {
     return () => clearInterval(id)
   }, [])
 
-  // Clock
+  // Clock: avoid hydration mismatches by waiting until the client has mounted
+  // before rendering the real time value.
   useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000)
+    const updateNow = () => setNow(new Date())
+    updateNow()
+    const id = setInterval(updateNow, 1000)
     return () => clearInterval(id)
   }, [])
+
+  const playChime = () => {
+    try {
+      const WebkitAudioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
+      const Ctx = window.AudioContext || WebkitAudioWindow.webkitAudioContext
+      if (!Ctx) return
+
+      const ctx = new Ctx()
+      const notes = [880, 1174]
+      notes.forEach((freq, i) => {
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.type = "sine"
+        osc.frequency.value = freq
+        osc.connect(gain)
+        gain.connect(ctx.destination)
+        const start = ctx.currentTime + i * 0.18
+        gain.gain.setValueAtTime(0.0001, start)
+        gain.gain.exponentialRampToValueAtTime(0.3, start + 0.02)
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35)
+        osc.start(start)
+        osc.stop(start + 0.36)
+      })
+    } catch {
+      // ignore
+    }
+  }
 
   // Announce a dispatched token in Tamil (twice) then English (twice).
   const announceDispatch = useCallback((tokenNumber: number) => {
@@ -143,30 +173,6 @@ export function DisplayBoard() {
     lastDispatchCallRef.current = calledAt
   }, [rows, soundOn, announceDispatch])
 
-  const playChime = () => {
-    try {
-      const Ctx = window.AudioContext || (window as any).webkitAudioContext
-      const ctx = new Ctx()
-      const notes = [880, 1174]
-      notes.forEach((freq, i) => {
-        const osc = ctx.createOscillator()
-        const gain = ctx.createGain()
-        osc.type = "sine"
-        osc.frequency.value = freq
-        osc.connect(gain)
-        gain.connect(ctx.destination)
-        const start = ctx.currentTime + i * 0.18
-        gain.gain.setValueAtTime(0.0001, start)
-        gain.gain.exponentialRampToValueAtTime(0.3, start + 0.02)
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35)
-        osc.start(start)
-        osc.stop(start + 0.36)
-      })
-    } catch {
-      // ignore
-    }
-  }
-
   const enableSound = () => {
     setSoundOn(true)
     // Unlock speech synthesis + audio with this user gesture.
@@ -180,8 +186,18 @@ export function DisplayBoard() {
     playChime()
   }
 
+  const timeText = now
+    ? now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "--:--:--"
+  const dateText = now
+    ? now.toLocaleDateString(lang === "ta" ? "ta-IN" : "en-GB", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+      })
+    : "--"
+
   const t = STRINGS[lang]
-  const featured = rows[0] ?? null
 
   const entry1 = rows.find((r) => r.station === "entry" && r.counter === 1) ?? null
   const entry2 = rows.find((r) => r.station === "entry" && r.counter === 2) ?? null
@@ -219,35 +235,12 @@ export function DisplayBoard() {
           ) : null}
           <div className="text-right">
             <div className="font-mono text-3xl font-bold tabular-nums text-black">
-              {now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+              {timeText}
             </div>
-            <div className="text-sm text-black/50">
-              {now.toLocaleDateString(lang === "ta" ? "ta-IN" : "en-GB", {
-                weekday: "long",
-                day: "numeric",
-                month: "long",
-              })}
-            </div>
+            <div className="text-sm text-black/50">{dateText}</div>
           </div>
         </div>
       </header>
-
-      {/* Featured "Now serving" */}
-      <section className="flex flex-col items-center justify-center gap-3 px-8 py-6">
-        <p className="text-lg font-semibold uppercase tracking-[0.3em] text-[#1d4ed8]">{t.nowServing}</p>
-        {featured ? (
-          <div className="flex flex-col items-center gap-2">
-            <div className="font-mono text-[10rem] font-extrabold leading-none tabular-nums text-[#15803d]">
-              {featured.token_number}
-            </div>
-            <div className="rounded-full bg-[#1d4ed8] px-8 py-2.5 text-xl font-bold text-white">
-              {stationTitle(featured.station, featured.counter)}
-            </div>
-          </div>
-        ) : (
-          <p className="max-w-2xl text-balance text-center text-2xl font-medium text-black/40">{t.idle}</p>
-        )}
-      </section>
 
       {/* Five-counter grid */}
       <section className="grid flex-1 grid-cols-2 gap-4 border-t-2 border-black/10 p-6 lg:grid-cols-5">
