@@ -87,7 +87,7 @@ export function DisplayBoard() {
   const announceDispatch = useCallback((tokenNumber: number) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return
 
-    const tamil = `டோக்கன் எண் ${tokenNumber}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்.`
+    const tamil = `Token எண் ${tokenNumber}, தயவுசெய்து மருந்து வழங்கும் counterku வரவும்.`
     const english = `Token number ${tokenNumber}, please proceed to the dispatch counter.`
 
     // Each phrase is spoken twice, Tamil first then English.
@@ -108,7 +108,7 @@ export function DisplayBoard() {
       u.lang = lang
       u.rate = 0.85
       u.pitch = 1
-      const v = pickVoice(lang.slice(0, 2))
+      const v = pickVoice(lang.slice(0, 1))
       if (v) u.voice = v
       u.onend = () => speakAt(i + 1)
       // If a voice errors out, still advance so the sequence never stalls.
