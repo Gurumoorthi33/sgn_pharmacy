@@ -70,29 +70,29 @@ export function DispensingPanel({ initialCount }: { initialCount: number }) {
 
   return (
     <div className="flex min-h-[calc(100vh-72px)] items-center justify-center px-6 py-10">
-      <div className="flex w-full max-w-5xl flex-col items-center justify-center gap-8 text-center">
-        <div className="flex flex-col items-center gap-3 rounded-3xl bg-white/70 px-8 py-7 shadow-sm ring-1 ring-border backdrop-blur-sm sm:px-12 lg:px-16">
-          <span className="text-xl font-semibold uppercase tracking-[0.2em] text-muted-foreground sm:text-2xl">
+      <div className="flex w-full max-w-6xl flex-col items-center justify-center gap-10 text-center">
+        <div className="flex flex-col items-center gap-4 rounded-[2rem] bg-white/80 px-10 py-8 shadow-sm ring-1 ring-border backdrop-blur-sm sm:px-16 lg:px-24">
+          <span className="text-2xl font-semibold uppercase tracking-[0.22em] text-muted-foreground sm:text-3xl lg:text-4xl">
             Tokens issued today
           </span>
-          <span className="font-mono text-6xl font-black leading-none tracking-tight text-foreground md:text-8xl">
+          <span className="font-mono text-8xl font-black leading-none tracking-tight text-foreground sm:text-9xl lg:text-[10rem]">
             {issuedToday}
           </span>
         </div>
 
         <Button
-          className="w-full max-w-3xl rounded-2xl px-8 py-8 text-xl font-bold sm:text-2xl md:text-3xl"
+          className="w-full max-w-4xl rounded-[1.5rem] px-10 py-8 text-2xl font-bold sm:text-3xl md:text-4xl"
           size="lg"
           disabled={pending}
           onClick={handleGenerate}
         >
-          <Printer className="mr-3 h-6 w-6 shrink-0 sm:h-7 sm:w-7" aria-hidden="true" />
+          <Printer className="mr-4 h-8 w-8 shrink-0 sm:h-9 sm:w-9" aria-hidden="true" />
           {pending ? "Generating..." : "Generate & Print Token"}
         </Button>
 
         {error ? (
           <p
-            className="max-w-3xl rounded-2xl bg-destructive/10 px-5 py-4 text-base font-medium text-destructive sm:text-lg"
+            className="max-w-4xl rounded-[1.25rem] bg-destructive/10 px-6 py-4 text-lg font-medium text-destructive sm:text-xl"
             role="alert"
             aria-live="polite"
           >

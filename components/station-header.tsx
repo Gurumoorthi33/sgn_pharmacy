@@ -1,9 +1,8 @@
 import Link from "next/link"
 import Image from "next/image"
-import { signOutAction } from "@/app/auth/actions"
-import { Button, buttonVariants } from "@/components/ui/button"
+import { buttonVariants } from "@/components/ui/button"
 import { HOSPITAL_SHORT, SYSTEM_NAME } from "@/lib/types"
-import { LogOut, MonitorPlay } from "lucide-react"
+import { MonitorPlay } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 export function StationHeader({
@@ -43,12 +42,6 @@ export function StationHeader({
           <MonitorPlay className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
           Display Board
         </Link>
-        <form action={signOutAction}>
-          <Button variant="outline" size="sm" type="submit" className="h-8 px-2.5 text-xs">
-            <LogOut className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
-            Sign out
-          </Button>
-        </form>
       </div>
     </header>
   )
