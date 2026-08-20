@@ -7,15 +7,15 @@ runs unchanged on three kinds of host - the send path is picked automatically
 from the detected platform, never from which env vars happen to be set:
 
 * Windows PC (win32print queue, e.g. "ZDesigner ZD230-203dpi ZPL", or CUPS).
-* Sunmi T2s Lite running Termux/Android - USB-attached ZD230 (vendor 0x0A5F)
-  reached through the file descriptor termux-usb grants (Termux sandboxes
-  /dev/bus/usb/*, so pyusb-style enumeration can never see the device): the
-  send_test.py worker wraps that fd with python-libusb1's wrapSysDevice() and
-  bulk-writes the ZPL.
+* Sunmi T2s Lite / Android - the native "SGN Print Bridge" Kotlin app
+  (foreground service using Zebra's Link-OS SDK) exposes a local HTTP server
+  on 127.0.0.1:6001; raw ZPL bytes are POSTed to it. TCP 9100 (PRINTER_IP)
+  also works from Android.
 * Generic Linux (dev/testing) - CUPS queue, e.g. "ZTC-ZD230-203dpi-ZPL".
 
-A PRINTER_IP override forces the TCP 9100 path on any platform (the future
-network-printing fallback).
+PRINTER_IP always wins: when it is set, the TCP 9100 send path is used on ANY
+platform - including Android/Termux - before any local transport is considered,
+so a networked ZD230 never needs USB at all.
 
 API:
 
@@ -25,7 +25,9 @@ API:
                     actually receive the bytes - never a false "success".
 * /api/print/diagnostics  one-request readiness report: detected platform,
                     active send path, and a live check that the printer is
-                    actually reachable right now.
+                    actually reachable right now. For the TCP 9100 path that is
+                    a real socket connect test to port 9100 (not just "IP is
+                    set") plus the last successful/failed print timestamps.
 * /api/print/       legacy PNG path (Windows only, unchanged).
 * /health           basic liveness + platform/backend summary.
 
@@ -36,29 +38,27 @@ Setup (Windows):
     set UPLOAD_FOLDER=C:\\sgn-prints
     uv run app.py
 
-Setup (Sunmi T2s Lite / Termux):
-    pkg install python libusb termux-api
+Setup (Sunmi T2s Lite / Android - native SGN Print Bridge app):
+    Install and start the "SGN Print Bridge" Kotlin app (foreground service).
+    It listens on 127.0.0.1:6001 and prints the raw ZPL it receives over HTTP.
+    Then run the bridge here:
     uv venv --python 3.12
     uv pip install --python .venv/bin/python -r requirements.txt
-    termux-usb -l                      # plug the ZD230 in via OTG, confirm it lists
-    # Identify the ZD230's /dev/bus/usb/... path - a hub/controller may list too:
-    #   termux-usb -r -e "echo granted" <path>   # repeat per listed path; the
-    # Android dialog that names the ZD230 wins. Pin it with
-    # PRINTER_USB_PATH=<path> if you like.
-    uv run app.py                      # auto-detects Android/Termux -> USB path
+    uv run app.py          # no PRINTER_IP / PRINTER_NAME needed on this device
+
+    # No pyusb/termux-usb is involved on Android anymore - Termux's USB sandbox
+    # broke direct libusb access (LIBUSB_ERROR_IO), so the Kotlin app owns USB
+    # via Zebra's Link-OS SDK and we just POST raw ZPL bytes to it.
 
 Environment:
     PRINTER_NAME    Windows ZPL driver queue, or the CUPS queue name on
-                    Linux/Termux (e.g. "ZTC-ZD230-203dpi-ZPL"). Only consulted
-                    on platforms where win32print/CUPS exist.
-    PRINTER_IP      Optional IP/hostname of a networked ZD230. Forces the TCP
-                    9100 send path on any platform (manual override for the
-                    future network fallback). PRINTER_HOST is accepted as a
-                    legacy alias.
+                    Linux (e.g. "ZTC-ZD230-203dpi-ZPL"). Never consulted on
+                    Android/Termux - there is no CUPS/win32print there.
+    PRINTER_IP      IP/hostname of a networked ZD230. When set, the TCP 9100
+                    send path is used on ANY platform - including Android/
+                    Termux, before any USB consideration. PRINTER_HOST is
+                    accepted as a legacy alias.
     PRINTER_PORT    Raw socket port for PRINTER_IP (default 9100).
-    PRINTER_USB_PATH  Android/Termux only: exact /dev/bus/usb/... path of the
-                      ZD230 from termux-usb -l. Optional - the bridge falls back
-                      to the device matching vendor 0x0A5F, then to a sole device.
     PRINTER_DPI     203 for the standard ZD230.
     ZPL_WIDTH_MM    Physical label width in mm (default 50 - standard 2" roll).
     ZPL_HEIGHT_MM   Physical label height in mm (default 25).
@@ -79,13 +79,12 @@ import logging
 import os
 import platform
 import re
-import shlex
+import requests
 import shutil
 import socket
 import subprocess
-import sys
-import tempfile
 import time
+from datetime import datetime
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -111,20 +110,16 @@ try:
 except Exception:  # pragma: no cover - non-Windows machines
     IMAGE_WINDOWS = False
 
-# USB path (Android/Termux). python-libusb1 is a pure-Python ctypes wrapper:
-# importing it never needs the libusb runtime, but USBContext()/wrapSysDevice()
-# do - we surface that clearly when it fails at use time. pyusb cannot work here:
-# Termux hands USB access out as a file descriptor, not an enumerable device.
-try:
-    import usb1  # noqa: F401 - import proves the wrapper is installed
+# Android/Termux (Sunmi T2s Lite): the native "SGN Print Bridge" Kotlin app.
+# Termux's USB sandbox breaks direct libusb access (LIBUSB_ERROR_IO), so labels
+# go over HTTP to the local foreground service on 127.0.0.1:6001, which prints
+# them with Zebra's Link-OS SDK. Raw ZPL bytes are the POST body.
+ANDROID_BRIDGE_URL = "http://127.0.0.1:6001"
+ANDROID_BRIDGE_RETRIES = 5  # the app may still be booting after a device restart
+ANDROID_BRIDGE_RETRY_DELAY_S = 2
+ANDROID_BRIDGE_TIMEOUT_S = 10
 
-    USB_LIBUSB1 = True
-except Exception:  # pragma: no cover - libusb1 not installed
-    USB_LIBUSB1 = False
-
-USB_METHOD = "termux-usb fd + libusb1 wrapSysDevice (send_test.py worker)"
-USB_TERMUX_DIALOG_TIMEOUT_S = 90
-SEND_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "send_test.py")
+USB_METHOD = "Android SGN Print Bridge (HTTP 127.0.0.1:6001)"
 
 LOG = logging.getLogger("sgn-print-bridge")
 _log_handler = logging.StreamHandler()
@@ -153,7 +148,6 @@ UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join(os.getcwd(), "sgn-p
 PRINTER_NAME = os.environ.get("PRINTER_NAME", "")
 PRINTER_IP = os.environ.get("PRINTER_IP") or os.environ.get("PRINTER_HOST") or ""
 PRINTER_PORT = int(os.environ.get("PRINTER_PORT", "9100"))
-PRINTER_USB_PATH = os.environ.get("PRINTER_USB_PATH", "")
 PRINTER_DPI = int(os.environ.get("PRINTER_DPI", "203"))
 ZPL_WIDTH_MM = int(os.environ.get("ZPL_WIDTH_MM", "50"))
 ZPL_HEIGHT_MM = int(os.environ.get("ZPL_HEIGHT_MM", "25"))
@@ -168,9 +162,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # env vars happen to be set - PRINTER_NAME is only consulted on platforms
 # where win32print/CUPS actually exist, so a PRINTER_NAME value copied to the
 # Sunmi cannot route it to a nonexistent CUPS queue. PRINTER_IP is honoured
-# everywhere so the future TCP 9100 network fallback overrides on any host.
-ZEBRA_USB_VID = 0x0A5F
-USB_WRITE_TIMEOUT_MS = 5000
+# everywhere so the TCP 9100 network path overrides on any host.
 
 
 def detect_platform(system=None, prefix=None, data_dir="/data/data/com.termux") -> str:
@@ -203,7 +195,7 @@ BACKEND_LABEL = {
     "socket": "TCP 9100",
     "win32print": "Windows win32print",
     "cups": "CUPS (lp)",
-    "usb": "USB (termux-usb + libusb1 wrapSysDevice)",
+    "usb": "Android SGN Print Bridge (HTTP 127.0.0.1:6001)",
     "none": "none",
 }
 
@@ -211,11 +203,15 @@ BACKEND_LABEL = {
 def select_backend(platform_: str | None = None) -> str:
     """Choose the active send path for `platform_` (defaults to PLATFORM)."""
     platform_ = platform_ or PLATFORM
+    # PRINTER_IP is checked FIRST, on every platform: a networked ZD230 never
+    # waits behind a local-transport decision, so Android/Termux reaches the
+    # TCP 9100 path before USB is even considered.
     if PRINTER_IP:
         return "socket"
     if platform_ == "android":
-        # Termux has no CUPS/win32print - USB is the only local transport and
-        # PRINTER_NAME is never relevant here, even if it happens to be set.
+        # Termux has no CUPS/win32print - PRINTER_NAME is never relevant here,
+        # even if it happens to be set. The native SGN Print Bridge app (HTTP
+        # 127.0.0.1:6001) is the Android send path.
         return "usb"
     if platform_ == "windows":
         if ZPL_WINDOWS and PRINTER_NAME:
@@ -231,11 +227,37 @@ def select_backend(platform_: str | None = None) -> str:
 
 BACKEND = select_backend()
 
-BANNER = (
-    f"Detected platform: {PLATFORM_LABEL} (os={platform.system()}, "
-    f"PREFIX={os.environ.get('PREFIX', '') or '(unset)'}) - "
-    f"send path: {BACKEND_LABEL[BACKEND]}"
-)
+# Last-print tracking so diagnostics can prove the path actually works: a
+# single curl shows when bytes last reached (or failed to reach) the printer.
+LAST_PRINT_OK_AT: str | None = None
+LAST_PRINT_FAILED_AT: str | None = None
+LAST_PRINT_FAILED_DETAIL: str | None = None
+
+
+def _record_print_success() -> None:
+    global LAST_PRINT_OK_AT, LAST_PRINT_FAILED_AT, LAST_PRINT_FAILED_DETAIL
+    LAST_PRINT_OK_AT = datetime.now().isoformat(timespec="seconds")
+    LAST_PRINT_FAILED_AT = None
+    LAST_PRINT_FAILED_DETAIL = None
+
+
+def _record_print_failure(detail: str) -> None:
+    global LAST_PRINT_FAILED_AT, LAST_PRINT_FAILED_DETAIL
+    LAST_PRINT_FAILED_AT = datetime.now().isoformat(timespec="seconds")
+    LAST_PRINT_FAILED_DETAIL = detail
+
+
+if PRINTER_IP:
+    BANNER = (
+        f"Detected platform: {PLATFORM_LABEL} - PRINTER_IP set - "
+        f"using TCP 9100 send path ({PRINTER_IP}:{PRINTER_PORT})"
+    )
+else:
+    BANNER = (
+        f"Detected platform: {PLATFORM_LABEL} (os={platform.system()}, "
+        f"PREFIX={os.environ.get('PREFIX', '') or '(unset)'}) - "
+        f"send path: {BACKEND_LABEL[BACKEND]}"
+    )
 LOG.info(BANNER)
 
 
@@ -597,186 +619,77 @@ def cups_readiness() -> tuple[bool, str]:
     return False, f"CUPS queue '{PRINTER_NAME}' not ready: {why}"
 
 
-# --- USB (Termux/Android) --------------------------------------------------
-# Termux sandboxes /dev/bus/usb/*: Android hands out a *file descriptor* for the
-# granted device (termux-usb), which pyusb-style enumeration can never see. We
-# send ZPL by running the standalone worker (send_test.py) through
-#     termux-usb -r -e "<python> send_test.py <zpl> --copies N" <device>
-# so the granted fd reaches wrapSysDevice() the supported way. The worker names
-# the failing step (device wrap / interface claim / write) so the bridge can
-# surface it instead of a generic 500.
-USB_DEV_PATH_RE = re.compile(r"(/dev/bus/usb/\d+/\d+)")
-USB_VIDPID_RE = re.compile(r"\b(?:0x)?([0-9a-fA-F]{4}):(?:0x)?([0-9a-fA-F]{4})\b")
+# --- Android/Termux (SGN Print Bridge HTTP) --------------------------------
+# Termux's USB sandbox breaks direct libusb access (LIBUSB_ERROR_IO), so the
+# Sunmi prints through the native "SGN Print Bridge" Kotlin app instead: a
+# foreground service that talks to the ZD230 with Zebra's Link-OS SDK and
+# exposes a local HTTP server on 127.0.0.1:6001. We POST the raw ZPL bytes
+# (the request body, NOT wrapped in JSON) and the app prints them.
 
-
-def termux_usb_devices() -> list[tuple[str, int | None, int | None, str]]:
-    """Run `termux-usb -l` and parse device paths (+ optional VID:PID).
-
-    Returns [(device_path, vid, pid, raw_line), ...]; vid/pid are None when the
-    listing does not include them. Raises RuntimeError when termux-usb is
-    missing or exits non-zero.
-    """
-    termux_usb = shutil.which("termux-usb")
-    if not termux_usb:
-        raise RuntimeError(
-            "termux-usb not found - install the Termux:API add-on (pkg install termux-api)"
-        )
-    proc = subprocess.run(
-        [termux_usb, "-l"], capture_output=True, text=True, timeout=10, check=False
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or f"termux-usb -l failed (exit {proc.returncode})")
-    devices: list[tuple[str, int | None, int | None, str]] = []
-    for line in proc.stdout.splitlines():
-        m = USB_DEV_PATH_RE.search(line)
-        if not m:
-            continue
-        vid = pid = None
-        vm = USB_VIDPID_RE.search(line)
-        if vm:
-            vid, pid = int(vm.group(1), 16), int(vm.group(2), 16)
-        devices.append((m.group(1), vid, pid, line.strip()))
-    return devices
-
-
-def resolve_usb_target() -> str:
-    """Which /dev/bus/usb/... path to print to.
-
-    PRINTER_USB_PATH (recorded from the termux-usb permission dialogs) wins;
-    otherwise the single Zebra VID 0x0A5F device is used, then a sole device.
-    Multiple non-Zebra devices fail loudly asking for PRINTER_USB_PATH.
-    """
-    if PRINTER_USB_PATH:
-        return PRINTER_USB_PATH
-    devices = termux_usb_devices()
-    zebras = [d for d in devices if d[1] == ZEBRA_USB_VID]
-    if zebras:
-        return zebras[0][0]
-    if len(devices) == 1:
-        return devices[0][0]
-    if not devices:
-        raise RuntimeError(
-            "no USB devices listed by termux-usb -l - is the ZD230 powered on "
-            "and plugged into the OTG adapter?"
-        )
-    paths = ", ".join(d[0] for d in devices)
-    raise RuntimeError(
-        f"{len(devices)} USB devices listed ({paths}) and none matches the Zebra "
-        "vendor 0x0A5F - set PRINTER_USB_PATH to the ZD230's path (find it by "
-        "running 'termux-usb -r -e \"echo granted\" <path>' for each listed device "
-        "and keeping the one whose Android dialog names the ZD230)"
-    )
+def android_bridge_readiness() -> tuple[bool, str]:
+    """(ok, detail) for the Android path - is the local Kotlin service on
+    127.0.0.1:6001 listening right now?"""
+    host, port = "127.0.0.1", 6001
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            pass
+    except OSError as exc:
+        return False, f"SGN Print Bridge unreachable on {host}:{port}: {exc}"
+    return True, f"SGN Print Bridge reachable on {host}:{port}"
 
 
 def usb_readiness() -> tuple[bool, str]:
-    """(ok, detail) for the USB path - wrapper, tooling and target present.
+    """(ok, detail) for the Android/Termux send path (name kept for the backend
+    dispatch): the SGN Print Bridge on 127.0.0.1:6001 must be reachable."""
+    return android_bridge_readiness()
 
-    A full write probe is intentionally NOT done here: it would trigger the
-    Android permission dialog on every request. Real failures surface loudly at
-    print time through the worker's step-specific errors.
+
+def _post_zpl_android(zpl: bytes) -> None:
+    """POST one raw-ZPL body to the SGN Print Bridge, retrying while the Kotlin
+    app is still booting after a device restart.
+
+    A connection refusal on an early attempt is not a hard failure - the retry
+    loop only raises the specific "unreachable" error once every attempt is
+    refused, so a booting service never surfaces as a silent success or a false
+    "print failed". A non-200 response is propagated verbatim (status + body)
+    so the dispensing station shows the real reason - e.g. "USB permission not
+    granted", "Printer not found", or a Zebra SDK exception - not a generic
+    failure.
     """
-    if not USB_LIBUSB1:
-        return (
-            False,
-            "libusb1 is not installed - pip install libusb1 "
-            "(on Termux also: pkg install libusb)",
-        )
-    if not shutil.which("termux-usb"):
-        return (
-            False,
-            "termux-usb not found - install the Termux:API add-on (pkg install termux-api)",
-        )
-    if not os.path.isfile(SEND_WORKER):
-        return False, f"USB worker script missing: {SEND_WORKER}"
-    try:
-        device = resolve_usb_target()
-    except RuntimeError as exc:
-        return False, str(exc)
-    try:
-        with usb1.USBContext():
-            usb1.getVersion()  # context creation loads libusb; raises if absent
-    except Exception as exc:  # noqa: BLE001 - libusb runtime missing
-        return False, f"libusb runtime unavailable: {exc}"
-    return True, f"ZD230 target: {device}; {USB_METHOD} (full write probe happens at print time)"
+    for attempt in range(1, ANDROID_BRIDGE_RETRIES + 1):
+        try:
+            resp = requests.post(
+                ANDROID_BRIDGE_URL, data=zpl, timeout=ANDROID_BRIDGE_TIMEOUT_S
+            )
+        except requests.exceptions.ConnectionError as exc:
+            if attempt < ANDROID_BRIDGE_RETRIES:
+                LOG.warning(
+                    "android: attempt %d/%d - bridge not reachable (%s); retrying in %ds",
+                    attempt, ANDROID_BRIDGE_RETRIES, exc, ANDROID_BRIDGE_RETRY_DELAY_S,
+                )
+                time.sleep(ANDROID_BRIDGE_RETRY_DELAY_S)
+            continue
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Android print service returned HTTP {resp.status_code}: "
+                f"{resp.text.strip() or '(no response body)'}"
+            )
+        LOG.info("android: printed via SGN Print Bridge (HTTP %d)", resp.status_code)
+        return
+    raise RuntimeError(
+        "Android print service unreachable on port 6001 — is the SGN Print Bridge app running?"
+    )
 
 
 def print_zpl_usb(zpl: bytes, copies: int = 1) -> None:
-    """Send raw ZPL to a USB ZD230 on Android/Termux.
+    """Send raw ZPL to the ZD230 on Android/Termux via the SGN Print Bridge app.
 
-    Runs the standalone worker (send_test.py) through termux-usb -r -e so the
-    granted device fd reaches wrapSysDevice() the supported way - never pyusb-
-    style enumeration, which Termux's sandbox breaks. The worker exits non-zero
-    (and prints ERROR: <step>) on any failure, which we surface as an HTTP 500.
+    The Kotlin service prints one label per POST, so each copy is its own
+    request; any failure surfaces as a step-specific RuntimeError that carries
+    the service's exact status and body (see _post_zpl_android).
     """
-    termux_usb = shutil.which("termux-usb")
-    if not termux_usb:
-        raise RuntimeError(
-            "USB print path requires termux-usb - install the Termux:API add-on "
-            "(pkg install termux-api)"
-        )
-    device = resolve_usb_target()
-    if not os.path.isfile(SEND_WORKER):
-        raise RuntimeError(f"USB worker script missing: {SEND_WORKER}")
-    LOG.info("usb: target device %s, %d bytes of ZPL", device, len(zpl))
-
-    fd_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix="sgn-zpl-", suffix=".zpl", delete=False
-        ) as fh:
-            fh.write(zpl)
-            fd_path = fh.name
-        command = " ".join(
-            shlex.quote(a)
-            for a in [sys.executable, SEND_WORKER, fd_path, "--copies", str(copies)]
-        )
-        LOG.info(
-            "usb: running termux-usb -r -e %r %s (worker grants a fresh fd for "
-            "this job; already-granted permission should not re-prompt)",
-            command,
-            device,
-        )
-        try:
-            proc = subprocess.run(
-                [termux_usb, "-r", "-e", command, device],
-                capture_output=True,
-                text=True,
-                timeout=USB_TERMUX_DIALOG_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired:
-            LOG.error(
-                "usb: termux-usb timed out after %ss (permission dialog? dead ZD230?)",
-                USB_TERMUX_DIALOG_TIMEOUT_S,
-            )
-            raise RuntimeError(
-                f"USB print timed out after {USB_TERMUX_DIALOG_TIMEOUT_S}s - "
-                "termux-usb may be stuck on the Android permission dialog or the "
-                "ZD230 is not responding"
-            ) from None
-    finally:
-        if fd_path:
-            try:
-                os.unlink(fd_path)
-            except OSError:
-                pass
-
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    if proc.returncode != 0 or "OK ZEBRA-USB" not in out:
-        LOG.error(
-            "usb: worker exit=%d stdout=%r stderr=%r",
-            proc.returncode,
-            out[-2000:],
-            err[-4000:],
-        )
-        raise RuntimeError(
-            "USB write failed (worker exit {}): {}".format(
-                proc.returncode, err or out or "no output from termux-usb"
-            )
-        )
-    LOG.info("usb: confirmed write -> %s", out)
-    if err:
-        LOG.debug("usb: worker stderr: %s", err)
+    for _ in range(max(1, copies)):
+        _post_zpl_android(zpl)
 
 
 # --- Legacy image path (unchanged behaviour) -----------------------------
@@ -845,20 +758,25 @@ def readiness_for_backend(backend: str) -> tuple[bool, str]:
 @app.get("/health")
 def health():
     lp_available = bool(shutil.which("lp"))
-    cups_status = cups_printer_status(PRINTER_NAME) if (PRINTER_NAME and lp_available) else ""
+    # CUPS does not exist on Termux - never report PRINTER_NAME/queue state there.
+    cups_status = (
+        cups_printer_status(PRINTER_NAME)
+        if (PLATFORM != "android" and PRINTER_NAME and lp_available)
+        else ""
+    )
     return {
         "ok": True,
         "platform": PLATFORM,
         "platform_detail": PLATFORM_LABEL,
-        "printer": PRINTER_NAME,
+        "printer": None if PLATFORM == "android" else (PRINTER_NAME or None),
         "printer_ip": PRINTER_IP or None,
+        "printer_port": PRINTER_PORT,
         "backend": BACKEND,
         "backend_label": BACKEND_LABEL[BACKEND],
         "zpl_windows": ZPL_WINDOWS,
         "image_windows": IMAGE_WINDOWS,
-        "usb_libusb1": USB_LIBUSB1,
         "usb_method": USB_METHOD,
-        "lp_available": lp_available,
+        "lp_available": lp_available if PLATFORM != "android" else False,
         "cups_status": cups_status,
         "cups_printer_ready": not (
             cups_status and ("disabled" in cups_status or "Waiting for printer to become available" in cups_status)
@@ -873,18 +791,28 @@ def print_diagnostics():
     """One-request report: platform, active send path, and a live readiness
     probe so "will this bridge actually print right now" is a single call."""
     checks = {}
-    if PLATFORM == "android" or USB_LIBUSB1:
+    if PLATFORM == "android":
         ok, detail = usb_readiness()
         checks["usb"] = {"ready": ok, "detail": detail}
     if ZPL_WINDOWS:
         ok, detail = win32print_readiness()
         checks["win32print"] = {"ready": ok, "detail": detail}
-    if shutil.which("lp"):
+    if PLATFORM != "android" and shutil.which("lp"):
+        # CUPS does not exist on Termux - never surface it for Android.
         ok, detail = cups_readiness()
         checks["cups"] = {"ready": ok, "detail": detail}
     if PRINTER_IP:
         ok, detail = socket_readiness()
-        checks["socket"] = {"ready": ok, "detail": detail}
+        checks["socket"] = {
+            "ready": ok,
+            "detail": detail,
+            "ip": PRINTER_IP,
+            "port": PRINTER_PORT,
+            "reachable": ok,
+            "last_success": LAST_PRINT_OK_AT,
+            "last_failure": LAST_PRINT_FAILED_AT,
+            "last_failure_detail": LAST_PRINT_FAILED_DETAIL,
+        }
 
     active_ok, active_detail = readiness_for_backend(BACKEND)
     return {
@@ -896,8 +824,12 @@ def print_diagnostics():
         "backend_ready": active_ok,
         "backend_detail": active_detail,
         "usb_method": USB_METHOD,
-        "printer_name": PRINTER_NAME or None,
+        "printer_name": None if PLATFORM == "android" else (PRINTER_NAME or None),
         "printer_ip": PRINTER_IP or None,
+        "printer_port": PRINTER_PORT,
+        "last_print_success": LAST_PRINT_OK_AT,
+        "last_print_failure": LAST_PRINT_FAILED_AT,
+        "last_print_failure_detail": LAST_PRINT_FAILED_DETAIL,
         "checks": checks,
     }
 
@@ -936,8 +868,8 @@ def print_zpl_api(payload: ZplRequest):
                 detail=(
                     f"No print backend is configured for platform {PLATFORM_LABEL}. "
                     "On Windows set PRINTER_NAME to the ZD230 queue; on Android/Termux "
-                    "connect the ZD230 over USB (termux-usb + libusb1); or set "
-                    "PRINTER_IP to force "
+                    "start the SGN Print Bridge app (HTTP 127.0.0.1:6001) or set "
+                    "PRINTER_IP to reach the ZD230 over TCP 9100; PRINTER_IP forces "
                     "the TCP 9100 path on any machine."
                 ),
             )
@@ -951,8 +883,10 @@ def print_zpl_api(payload: ZplRequest):
             payload.copies,
             len(zpl),
         )
+        _record_print_failure(str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    _record_print_success()
     return {"ok": True, "copies": copies, "backend": BACKEND}
 
 

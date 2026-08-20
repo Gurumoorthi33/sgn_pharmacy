@@ -10,6 +10,7 @@ three hosts, plus each send path's "unplugged printer" behaviour failing loudly
 instead of pretending to succeed.
 """
 
+import requests
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -110,102 +111,110 @@ def test_socket_path_missing_config():
         app.PRINTER_IP = saved
 
 
-def test_usb_path_fails_loudly_without_device():
-    # On this machine there is no termux-usb (not Termux), so both the readiness
-    # probe and a print must report a real error, never a fake success.
-    if not app.USB_LIBUSB1:
-        raise AssertionError("expected libusb1 to be importable in this venv")
-    ok, detail = app.usb_readiness()
-    assert ok is False, f"no USB path on this host -> readiness must be False, got: {detail}"
-    assert "termux-usb" in detail, detail
+def test_android_http_path_fails_loudly_when_service_down():
+    # SGN Print Bridge not running -> ConnectionError on every attempt -> the
+    # retry loop must exhaust and raise the specific "unreachable" error - never
+    # a silent success.
+    saved = (
+        app.ANDROID_BRIDGE_RETRIES,
+        app.ANDROID_BRIDGE_RETRY_DELAY_S,
+        app.requests.post,
+    )
     try:
-        app.print_zpl_usb(b"^XA^XZ")
-    except RuntimeError as exc:
-        assert "termux-usb" in str(exc), str(exc)
-    else:
-        raise AssertionError("USB print without termux-usb must raise")
+        app.ANDROID_BRIDGE_RETRIES = 3
+        app.ANDROID_BRIDGE_RETRY_DELAY_S = 0
 
+        def _down(*a, **k):
+            raise requests.exceptions.ConnectionError("connection refused")
 
-class _FakeProc:
-    def __init__(self, returncode=0, stdout="", stderr=""):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-def test_usb_target_selection():
-    saved = (app.shutil.which, app.subprocess.run, app.PRINTER_USB_PATH)
-    try:
-        app.shutil.which = lambda name: "/data/data/com.termux/files/usr/bin/termux-usb"
-        app.PRINTER_USB_PATH = ""
-
-        # Two listed devices, one with Zebra VID -> pick the Zebra.
-        app.subprocess.run = lambda cmd, **kw: _FakeProc(
-            0, stdout="/dev/bus/usb/001/005\n/dev/bus/usb/001/007 0a5f:0071\n"
-        )
-        assert app.resolve_usb_target() == "/dev/bus/usb/001/007"
-
-        # No VID info in the listing and two devices -> fail loudly asking for
-        # PRINTER_USB_PATH instead of guessing.
-        app.subprocess.run = lambda cmd, **kw: _FakeProc(
-            0, stdout="/dev/bus/usb/001/005\n/dev/bus/usb/001/007\n"
-        )
-        try:
-            app.resolve_usb_target()
-        except RuntimeError as exc:
-            assert "PRINTER_USB_PATH" in str(exc) and "001/005" in str(exc), str(exc)
-        else:
-            raise AssertionError("two anonymous devices must require PRINTER_USB_PATH")
-
-        # PRINTER_USB_PATH pins the device regardless of the listing.
-        app.PRINTER_USB_PATH = "/dev/bus/usb/001/005"
-        assert app.resolve_usb_target() == "/dev/bus/usb/001/005"
-
-        # Empty listing -> loud "no USB devices" error.
-        app.PRINTER_USB_PATH = ""
-        app.subprocess.run = lambda cmd, **kw: _FakeProc(0, stdout="[]\n")
-        try:
-            app.resolve_usb_target()
-        except RuntimeError as exc:
-            assert "no USB devices" in str(exc), str(exc)
-        else:
-            raise AssertionError("empty listing must fail loudly")
-    finally:
-        app.shutil.which, app.subprocess.run, app.PRINTER_USB_PATH = saved
-
-
-def test_usb_worker_invocation():
-    # The bridge must run termux-usb -r -e with the send_test.py worker and
-    # surface a worker failure as a step-specific RuntimeError - never a
-    # silent success (the "OK ZEBRA-USB" marker must be absent).
-    calls = []
-
-    def fake_run(cmd, **kw):
-        calls.append(cmd)
-        return _FakeProc(
-            returncode=1,
-            stderr="ERROR: device wrap failed (wrapSysDevice): USBErrorIO: LIBUSB_ERROR_IO [-1]",
-        )
-
-    saved = (app.shutil.which, app.subprocess.run, app.PRINTER_USB_PATH)
-    try:
-        app.PRINTER_USB_PATH = "/dev/bus/usb/001/007"
-        app.shutil.which = lambda name: "/data/data/com.termux/files/usr/bin/termux-usb"
-        app.subprocess.run = fake_run
+        app.requests.post = _down
         try:
             app.print_zpl_usb(b"^XA^XZ")
         except RuntimeError as exc:
-            assert "USB write failed" in str(exc) and "device wrap failed" in str(exc), str(exc)
+            assert "unreachable on port 6001" in str(exc), str(exc)
         else:
-            raise AssertionError("worker failure must raise RuntimeError")
-
-        assert calls, "termux-usb must be invoked"
-        termux_usb, dash_r, dash_e, command, device = calls[0]
-        assert termux_usb.endswith("termux-usb") and dash_r == "-r" and dash_e == "-e", calls[0]
-        assert device == "/dev/bus/usb/001/007"
-        assert "send_test.py" in command and "--copies" in command, command
+            raise AssertionError("unreachable service must raise RuntimeError")
     finally:
-        app.shutil.which, app.subprocess.run, app.PRINTER_USB_PATH = saved
+        (
+            app.ANDROID_BRIDGE_RETRIES,
+            app.ANDROID_BRIDGE_RETRY_DELAY_S,
+            app.requests.post,
+        ) = saved
+
+
+def test_android_http_path_propagates_non_200():
+    # Service up but refusing the print: a 403 with body "USB permission not
+    # granted" must surface the exact status + body, never a generic failure.
+    saved = (
+        app.ANDROID_BRIDGE_RETRIES,
+        app.ANDROID_BRIDGE_RETRY_DELAY_S,
+        app.requests.post,
+    )
+    try:
+        app.ANDROID_BRIDGE_RETRIES = 1
+        app.ANDROID_BRIDGE_RETRY_DELAY_S = 0
+
+        class _Resp:
+            status_code = 403
+            text = "USB permission not granted"
+
+        app.requests.post = lambda *a, **k: _Resp()
+        try:
+            app.print_zpl_usb(b"^XA^XZ")
+        except RuntimeError as exc:
+            assert "HTTP 403" in str(exc) and "USB permission not granted" in str(exc), str(exc)
+        else:
+            raise AssertionError("non-200 response must raise RuntimeError")
+    finally:
+        (
+            app.ANDROID_BRIDGE_RETRIES,
+            app.ANDROID_BRIDGE_RETRY_DELAY_S,
+            app.requests.post,
+        ) = saved
+
+
+def test_android_http_path_success_posts_raw_zpl_per_copy():
+    # 200 -> return without error; raw ZPL bytes must be the request body (not
+    # JSON-wrapped) and one POST must happen per copy.
+    saved = (
+        app.ANDROID_BRIDGE_RETRIES,
+        app.ANDROID_BRIDGE_RETRY_DELAY_S,
+        app.requests.post,
+    )
+    try:
+        app.ANDROID_BRIDGE_RETRIES = 1
+        app.ANDROID_BRIDGE_RETRY_DELAY_S = 0
+        calls = []
+
+        class _Resp:
+            status_code = 200
+            text = "printed"
+
+        def _ok(*a, **k):
+            calls.append((a, k))
+            return _Resp()
+
+        app.requests.post = _ok
+        app.print_zpl_usb(b"^XA^XZ", copies=2)
+        assert len(calls) == 2, f"expected one POST per copy, got {len(calls)}"
+        args, kwargs = calls[0]
+        assert args[0] == app.ANDROID_BRIDGE_URL, args
+        assert kwargs["data"] == b"^XA^XZ", "raw ZPL bytes must be the request body"
+        assert "json" not in kwargs, "body must NOT be JSON-wrapped"
+    finally:
+        (
+            app.ANDROID_BRIDGE_RETRIES,
+            app.ANDROID_BRIDGE_RETRY_DELAY_S,
+            app.requests.post,
+        ) = saved
+
+
+def test_android_readiness_reports_service_down():
+    # No SGN Print Bridge listening on 127.0.0.1:6001 here -> readiness must
+    # be False and mention the port.
+    ok, detail = app.usb_readiness()
+    assert ok is False, f"expected not ready, got: {detail}"
+    assert "6001" in detail, detail
 
 
 def test_cups_path_fails_loudly_for_unknown_queue():
@@ -371,17 +380,50 @@ def test_send_test_write_retry_recovers_from_transient_io():
     assert calls["bulk"] == 3, f"expected 3 attempts (2 transient + 1 success), got {calls['bulk']}"
 
 
+def test_diagnostics_hides_cups_on_android():
+    # CUPS/PRINTER_NAME must never resurface on Android/Termux, and the TCP
+    # 9100 diagnostics must carry a live reachability probe + last-print stamps.
+    saved = (
+        app.PLATFORM, app.BACKEND, app.PRINTER_IP, app.PRINTER_NAME,
+        app.LAST_PRINT_OK_AT, app.LAST_PRINT_FAILED_AT, app.LAST_PRINT_FAILED_DETAIL,
+    )
+    try:
+        app.PLATFORM = "android"
+        app.BACKEND = "socket"
+        app.PRINTER_IP = "127.0.0.1"
+        app.PRINTER_NAME = "ZTC-ZD230-203dpi-ZPL"  # copied Linux convention - must be ignored
+        app.LAST_PRINT_OK_AT = "2026-08-18T13:00:00"
+        app.LAST_PRINT_FAILED_AT = None
+        app.LAST_PRINT_FAILED_DETAIL = None
+        data = app.print_diagnostics()
+        assert data["backend"] == "socket", "Android + PRINTER_IP -> TCP 9100"
+        assert "cups" not in data["checks"], f"CUPS must be hidden on Android: {data['checks']}"
+        assert data["printer_name"] is None, "PRINTER_NAME is irrelevant on Android"
+        sock = data["checks"]["socket"]
+        assert sock["ip"] == "127.0.0.1" and sock["port"] == 9100, sock
+        assert sock["ready"] is False, "127.0.0.1:9100 is not listening -> not reachable"
+        assert sock["last_success"] == "2026-08-18T13:00:00", sock
+        assert data["last_print_success"] == "2026-08-18T13:00:00", data
+    finally:
+        (
+            app.PLATFORM, app.BACKEND, app.PRINTER_IP, app.PRINTER_NAME,
+            app.LAST_PRINT_OK_AT, app.LAST_PRINT_FAILED_AT, app.LAST_PRINT_FAILED_DETAIL,
+        ) = saved
+
+
 if __name__ == "__main__":
     print("platform detection + backend selection tests")
     check("platform detection across Windows/Termux/Linux", test_platform_detection)
     check("backend selection per platform (Android ignores PRINTER_NAME)", test_backend_selection)
     check("socket path fails loudly on unreachable printer", test_socket_path_fails_loudly)
     check("socket path fails loudly when unconfigured", test_socket_path_missing_config)
-    check("USB path fails loudly with no device attached", test_usb_path_fails_loudly_without_device)
-    check("USB target resolution (Zebra / PRINTER_USB_PATH / multi-device)", test_usb_target_selection)
-    check("USB worker invocation + step-specific failure", test_usb_worker_invocation)
+    check("Android HTTP path fails loudly when service is down", test_android_http_path_fails_loudly_when_service_down)
+    check("Android HTTP path propagates non-200 status + body", test_android_http_path_propagates_non_200)
+    check("Android HTTP path posts raw ZPL per copy", test_android_http_path_success_posts_raw_zpl_per_copy)
+    check("Android readiness reports service down", test_android_readiness_reports_service_down)
     check("CUPS path fails loudly for unknown queue", test_cups_path_fails_loudly_for_unknown_queue)
     check("readiness dispatch for unknown backend", test_readiness_dispatch)
+    check("diagnostics hide CUPS on Android + TCP reachability stamps", test_diagnostics_hides_cups_on_android)
     check("worker picks OUT bulk endpoint from real descriptors", test_send_test_find_out_bulk_real_descriptors)
     check("worker retries transient IO error on write", test_send_test_write_retry_recovers_from_transient_io)
     sys.exit(PASS)
