@@ -113,18 +113,16 @@ export function DisplayBoard() {
     }
   }
 
-  // Announce a dispatched token in Tamil (twice) then English (twice).
+  // Announce a dispatched token in Tamil (once) then English (once).
   const announceDispatch = useCallback((tokenNumber: number) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return
 
     const tamil = `Token எண் ${tokenNumber}, தயவுசெய்து மருந்து வழங்கும் counterku வரவும்.`
     const english = `Token number ${tokenNumber}, please proceed to the dispatch counter.`
 
-    // Each phrase is spoken twice, Tamil first then English.
+    // Each phrase is spoken once, Tamil first then English.
     const queue: { text: string; lang: string }[] = [
       { text: tamil, lang: "ta-IN" },
-      { text: tamil, lang: "ta-IN" },
-      { text: english, lang: "en-IN" },
       { text: english, lang: "en-IN" },
     ]
 
