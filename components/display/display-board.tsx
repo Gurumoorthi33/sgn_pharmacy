@@ -49,10 +49,8 @@ export function DisplayBoard() {
   const [tamilVoiceMissing, setTamilVoiceMissing] = useState(false)
   const lastDispatchCallRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
-  // Guards against duplicate/overlapping announcements (stale poll responses
-  // racing the realtime event).
-  const lastAnnouncedAtRef = useRef(0)
-  const pendingSpeechTimerRef = useRef<number | null>(null)
+  // Language to use for the NEXT announcement; alternates ta -> en -> ta.
+  const announceLanguageRef = useRef<"ta" | "en">("ta")
   const tamilWarnedRef = useRef(false)
 
   // Load + subscribe to the live board
@@ -151,26 +149,29 @@ export function DisplayBoard() {
     }
   }
 
-  // Announce a dispatched token: Tamil first, then English, once each —
-  // every single call, whether new or a "Call Again" recall.
+  // Announce a dispatched token, alternating Tamil and English between calls
+  // (Tamil on one call, English on the next, and so on — recalls included).
   const announceDispatch = useCallback((tokenNumber: number) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return
 
-    const tamil = `Token எண் ${tokenNumber}, தயவுசெய்து மருந்து வழங்கும் counterku வரவும்.`
+    const tamil = `Token எண் ${tokenNumber}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்.`
     const english = `Token number ${tokenNumber}, please proceed to the dispatch counter.`
 
     const voices = window.speechSynthesis.getVoices()
     const pickVoice = (prefix: string) => voices.find((v) => v.lang?.toLowerCase().startsWith(prefix))
 
     // Never let a non-Tamil voice read Tamil script — it produces garbled
-    // pronunciation. If no genuine ta* voice exists, skip the Tamil line and
-    // speak English only (no-op on devices with a real Tamil voice). Missing-
-    // voice surfacing (badge/console) is handled by the voiceschanged effect.
-    const hasTamilVoice = !!pickVoice("ta")
+    // pronunciation. If no genuine ta* voice exists, skip straight to English.
+    let nextLang = announceLanguageRef.current
+    if (nextLang === "ta" && !pickVoice("ta")) {
+      setTamilVoiceMissing(true)
+      nextLang = "en"
+    }
+    // Flip for whichever call comes next (including recalls).
+    announceLanguageRef.current = nextLang === "ta" ? "en" : "ta"
 
     const queue: { text: string; lang: string }[] = [
-      ...(hasTamilVoice ? [{ text: tamil, lang: "ta-IN" }] : []),
-      { text: english, lang: "en-IN" },
+      { text: nextLang === "ta" ? tamil : english, lang: nextLang === "ta" ? "ta-IN" : "en-IN" },
     ]
 
     const speakAt = (i: number) => {
@@ -188,15 +189,10 @@ export function DisplayBoard() {
       window.speechSynthesis.speak(u)
     }
 
-    // Play a short chime, then run the sequence. Clear any previously
-    // scheduled speech first so rapid re-triggers can never overlap.
+    // Play a short chime, then run the sequence.
     playChime()
-    if (pendingSpeechTimerRef.current !== null) clearTimeout(pendingSpeechTimerRef.current)
     window.speechSynthesis.cancel()
-    pendingSpeechTimerRef.current = window.setTimeout(() => {
-      pendingSpeechTimerRef.current = null
-      speakAt(0)
-    }, 450)
+    setTimeout(() => speakAt(0), 450)
   }, [])
 
   // Watch the dispatch counter; announce whenever it is called — a NEW token
@@ -214,20 +210,8 @@ export function DisplayBoard() {
       return
     }
 
-    // Only ever move FORWARD in time: a stale poll response carrying an older
-    // called_at must not re-trigger. The 1.2s window collapses duplicate
-    // triggers (realtime + poll racing on the same click) into one announcement.
-    const isNewCall =
-      current !== null &&
-      calledAt !== null &&
-      calledAt > (lastDispatchCallRef.current ?? "") &&
-      Date.now() - lastAnnouncedAtRef.current > 1200
-
-    if (isNewCall) {
-      if (soundOn) {
-        lastAnnouncedAtRef.current = Date.now()
-        announceDispatch(current)
-      }
+    if (current !== null && calledAt !== null && calledAt !== lastDispatchCallRef.current) {
+      if (soundOn) announceDispatch(current)
     }
     lastDispatchCallRef.current = calledAt
   }, [rows, soundOn, announceDispatch])
