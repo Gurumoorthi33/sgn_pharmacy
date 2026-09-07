@@ -153,11 +153,18 @@ export function DisplayBoard() {
     ]
     await Promise.allSettled(
       paths.map(async (path) => {
-        const res = await fetch(path)
-        if (!res.ok) return
-        const buf = await ctx.decodeAudioData(await res.arrayBuffer())
-        audioBuffersRef.current.set(path, buf)
+        try {
+          const arrayBuffer = await fetch(path).then((r) => r.arrayBuffer())
+          const decoded = await ctx.decodeAudioData(arrayBuffer)
+          audioBuffersRef.current.set(path, decoded)
+          console.log(`[audio] decoded OK: ${path}, duration=${decoded.duration}`)
+        } catch (err) {
+          console.error(`[audio] DECODE FAILED for ${path}:`, err)
+        }
       }),
+    )
+    console.log(
+      `[audio] preload complete: ${audioBuffersRef.current.size}/${paths.length} clips decoded`,
     )
   }
 
