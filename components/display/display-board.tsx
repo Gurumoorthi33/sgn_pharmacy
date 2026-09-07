@@ -98,7 +98,11 @@ export function DisplayBoard() {
     const WebkitAudioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
     const Ctx = window.AudioContext || WebkitAudioWindow.webkitAudioContext
     if (!Ctx) return null
-    audioCtxRef.current = new Ctx()
+    try {
+      audioCtxRef.current = new Ctx()
+    } catch {
+      audioCtxRef.current = null
+    }
     return audioCtxRef.current
   }, [])
 
@@ -195,13 +199,21 @@ export function DisplayBoard() {
     lastDispatchCallRef.current = calledAt
   }, [rows, soundOn, announceDispatch])
 
-  const enableSound = async () => {
+  const enableSound = () => {
     setSoundOn(true)
     // Resume the shared AudioContext under this user gesture — Chrome/Silk
     // block autoplay without one. This unlock covers both the chime and
     // subsequent AudioBufferSourceNode playback since they share the same ctx.
+    // resume() must never block or crash: rejections are swallowed so the
+    // chime and preload always run.
     const ctx = getAudioContext()
-    if (ctx?.state === "suspended") await ctx.resume()
+    try {
+      if (ctx && ctx.state === "suspended") {
+        ctx.resume().catch(() => {})
+      }
+    } catch {
+      // ignore
+    }
     preloadAudioBuffers()
     playChime()
   }
