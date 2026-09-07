@@ -201,11 +201,12 @@ export function DisplayBoard() {
 
   const enableSound = () => {
     setSoundOn(true)
-    // Resume the shared AudioContext under this user gesture — Chrome/Silk
-    // block autoplay without one. This unlock covers both the chime and
-    // subsequent AudioBufferSourceNode playback since they share the same ctx.
-    // resume() must never block or crash: rejections are swallowed so the
-    // chime and preload always run.
+    // MUST be first, synchronous, no async work before this block. Silk
+    // invalidates the trusted user gesture the moment an await occurs before
+    // the audio unlock completes, so create + resume the shared AudioContext
+    // up front with zero async work, then play the chime as part of the same
+    // uninterrupted synchronous block. Any rejects are swallowed so this
+    // sequence can never stall.
     const ctx = getAudioContext()
     try {
       if (ctx && ctx.state === "suspended") {
@@ -214,8 +215,12 @@ export function DisplayBoard() {
     } catch {
       // ignore
     }
-    preloadAudioBuffers()
+    // Chime first — proves the context unlocked on-device. No await before the
+    // oscillators start; both notes are scheduled synchronously.
     playChime()
+    // Async fetch/decode of MP3 buffers runs AFTER the unlock+chime block, as
+    // a separate non-blocking step — never preceding or interleaved with it.
+    preloadAudioBuffers()
   }
 
   const timeText = now
