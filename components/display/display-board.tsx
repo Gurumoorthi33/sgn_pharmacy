@@ -48,6 +48,8 @@ export function DisplayBoard() {
   const [soundOn, setSoundOn] = useState(false)
   const lastDispatchCallRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const audioBuffersRef = useRef<Map<string, AudioBuffer>>(new Map())
 
   // Load + subscribe to the live board
   useEffect(() => {
@@ -86,63 +88,91 @@ export function DisplayBoard() {
     return () => clearInterval(id)
   }, [])
 
-  const playChime = () => {
-    try {
-      const WebkitAudioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
-      const Ctx = window.AudioContext || WebkitAudioWindow.webkitAudioContext
-      if (!Ctx) return
+  // Lazily create or return the single AudioContext shared by the chime and
+  // MP3 playback. Silk on Fire TV only propagates an audio-unlock gesture to
+  // the AudioContext that was active at click-time — HTMLMediaElements created
+  // later via new Audio() stay muted. Both systems share one context so the
+  // unlock gesture covers everything.
+  const getAudioContext = useCallback(() => {
+    if (audioCtxRef.current) return audioCtxRef.current
+    const WebkitAudioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
+    const Ctx = window.AudioContext || WebkitAudioWindow.webkitAudioContext
+    if (!Ctx) return null
+    audioCtxRef.current = new Ctx()
+    return audioCtxRef.current
+  }, [])
 
-      const ctx = new Ctx()
-      const notes = [880, 1174]
-      notes.forEach((freq, i) => {
-        const osc = ctx.createOscillator()
-        const gain = ctx.createGain()
-        osc.type = "sine"
-        osc.frequency.value = freq
-        osc.connect(gain)
-        gain.connect(ctx.destination)
-        const start = ctx.currentTime + i * 0.18
-        gain.gain.setValueAtTime(0.0001, start)
-        gain.gain.exponentialRampToValueAtTime(0.3, start + 0.02)
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35)
-        osc.start(start)
-        osc.stop(start + 0.36)
-      })
-    } catch {
-      // ignore
-    }
+  // Play a two-note chime on the shared AudioContext.
+  const playChime = useCallback(() => {
+    const ctx = getAudioContext()
+    if (!ctx) return
+    const notes = [880, 1174]
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      osc.type = "sine"
+      osc.frequency.value = freq
+      osc.connect(gain)
+      gain.connect(ctx.destination)
+      const start = ctx.currentTime + i * 0.18
+      gain.gain.setValueAtTime(0.0001, start)
+      gain.gain.exponentialRampToValueAtTime(0.3, start + 0.02)
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35)
+      osc.start(start)
+      osc.stop(start + 0.36)
+    })
+  }, [getAudioContext])
+
+  // Pre-fetch and decode all Tamil MP3 clips into AudioBuffer objects held in
+  // memory. Called once on the "Enable announcements" click gesture so every
+  // subsequent dispatch can play instantly with zero network latency.
+  const preloadAudioBuffers = async () => {
+    const ctx = getAudioContext()
+    if (!ctx) return
+    const paths = [
+      "/audio/ta/token-num.mp3",
+      "/audio/ta/please-proceed.mp3",
+      ...Array.from({ length: 100 }, (_, i) => `/audio/ta/num-${i}.mp3`),
+    ]
+    await Promise.allSettled(
+      paths.map(async (path) => {
+        const res = await fetch(path)
+        if (!res.ok) return
+        const buf = await ctx.decodeAudioData(await res.arrayBuffer())
+        audioBuffersRef.current.set(path, buf)
+      }),
+    )
   }
 
-  // Announce a dispatched token by playing pre-generated static Tamil MP3
-  // clips. speechSynthesis is non-functional across deployment targets (TCL
-  // TV native browser, Silk on Fire TV), so we play committed static files
-  // instead. Queue: "Token எண்" → <number> → "தயவுசெய்து ...".
+  // Announce a dispatched token by playing pre-decoded Tamil AudioBuffers
+  // through the shared AudioContext. Queue: prefix → number → suffix, chained
+  // via AudioBufferSourceNode.onended so clips play back-to-back with no gaps.
   const announceDispatch = useCallback((tokenNumber: number) => {
-    if (typeof window === "undefined") return
+    const ctx = getAudioContext()
+    if (!ctx) return
 
-    // Build + preload the whole queue before playback begins to avoid any
-    // audible gap while files download mid-sequence.
-    const sources = [
+    const paths = [
       "/audio/ta/token-num.mp3",
       `/audio/ta/num-${tokenNumber}.mp3`,
       "/audio/ta/please-proceed.mp3",
     ]
-    const queue = sources.map((src) => new Audio(src))
-    queue.forEach((audio) => audio.load())
+    const buffers = paths
+      .map((p) => audioBuffersRef.current.get(p))
+      .filter(Boolean) as AudioBuffer[]
+    if (buffers.length === 0) return
 
     const playNext = (i: number) => {
-      if (i >= queue.length) return
-      const audio = queue[i]
-      audio.onended = () => playNext(i + 1)
-      // If a clip fails to load/decode, still advance so the sequence never stalls.
-      audio.onerror = () => playNext(i + 1)
-      audio.play().catch(() => playNext(i + 1))
+      if (i >= buffers.length) return
+      const source = ctx.createBufferSource()
+      source.buffer = buffers[i]
+      source.connect(ctx.destination)
+      source.onended = () => playNext(i + 1)
+      source.start()
     }
 
-    // Play a short chime, then run the sequence after the same 450ms delay.
     playChime()
     setTimeout(() => playNext(0), 450)
-  }, [])
+  }, [playChime, getAudioContext])
 
   // Watch the dispatch counter; announce whenever it is called — a NEW token
   // OR the same token re-called ("Call again"). We key off dispatch_called_at,
@@ -165,18 +195,14 @@ export function DisplayBoard() {
     lastDispatchCallRef.current = calledAt
   }, [rows, soundOn, announceDispatch])
 
-  const enableSound = () => {
+  const enableSound = async () => {
     setSoundOn(true)
-    // Unlock <audio> playback with this user gesture — Chrome/Silk block
-    // autoplay without one. Play a real short clip so subsequent announcements
-    // aren't blocked.
-    try {
-      const unlock = new Audio("/audio/ta/please-proceed.mp3")
-      unlock.volume = 0
-      unlock.play().catch(() => {})
-    } catch {
-      // ignore
-    }
+    // Resume the shared AudioContext under this user gesture — Chrome/Silk
+    // block autoplay without one. This unlock covers both the chime and
+    // subsequent AudioBufferSourceNode playback since they share the same ctx.
+    const ctx = getAudioContext()
+    if (ctx?.state === "suspended") await ctx.resume()
+    preloadAudioBuffers()
     playChime()
   }
 
