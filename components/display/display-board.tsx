@@ -46,12 +46,8 @@ export function DisplayBoard() {
   const [lang, setLang] = useState<Lang>("en")
   const [now, setNow] = useState<Date | null>(null)
   const [soundOn, setSoundOn] = useState(false)
-  const [tamilVoiceMissing, setTamilVoiceMissing] = useState(false)
   const lastDispatchCallRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
-  // Language to use for the NEXT announcement; alternates ta -> en -> ta.
-  const announceLanguageRef = useRef<"ta" | "en">("ta")
-  const tamilWarnedRef = useRef(false)
 
   // Load + subscribe to the live board
   useEffect(() => {
@@ -90,38 +86,6 @@ export function DisplayBoard() {
     return () => clearInterval(id)
   }, [])
 
-  // Detect whether a genuine Tamil voice exists on this device. Chrome loads
-  // voices asynchronously, so re-check on "voiceschanged". Without a real ta*
-  // voice, an English default reading Tamil script produces garbled audio —
-  // surface that gap instead of playing bad audio silently.
-  useEffect(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return
-
-    const checkVoices = () => {
-      const voices = window.speechSynthesis.getVoices()
-      if (voices.length === 0) return // voices not loaded yet
-      const hasTamil = voices.some((v) => v.lang?.toLowerCase().startsWith("ta"))
-      if (!hasTamil) {
-        setTamilVoiceMissing(true)
-        if (!tamilWarnedRef.current) {
-          tamilWarnedRef.current = true
-          console.warn(
-            "[display-board] No Tamil (ta*) voice installed on this device. " +
-              "Install a Tamil voice pack (Windows: Settings > Time & Language > Add 'தமிழ்'; " +
-              "Android: Google TTS language download). Announcements will play in English only.",
-          )
-        }
-      } else {
-        tamilWarnedRef.current = false
-        setTamilVoiceMissing(false)
-      }
-    }
-
-    checkVoices()
-    window.speechSynthesis.addEventListener("voiceschanged", checkVoices)
-    return () => window.speechSynthesis.removeEventListener("voiceschanged", checkVoices)
-  }, [])
-
   const playChime = () => {
     try {
       const WebkitAudioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
@@ -149,50 +113,35 @@ export function DisplayBoard() {
     }
   }
 
-  // Announce a dispatched token, alternating Tamil and English between calls
-  // (Tamil on one call, English on the next, and so on — recalls included).
+  // Announce a dispatched token by playing pre-generated static Tamil MP3
+  // clips. speechSynthesis is non-functional across deployment targets (TCL
+  // TV native browser, Silk on Fire TV), so we play committed static files
+  // instead. Queue: "Token எண்" → <number> → "தயவுசெய்து ...".
   const announceDispatch = useCallback((tokenNumber: number) => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return
+    if (typeof window === "undefined") return
 
-    const tamil = `Token எண் ${tokenNumber}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்.`
-    const english = `Token number ${tokenNumber}, please proceed to the dispatch counter.`
-
-    const voices = window.speechSynthesis.getVoices()
-    const pickVoice = (prefix: string) => voices.find((v) => v.lang?.toLowerCase().startsWith(prefix))
-
-    // Never let a non-Tamil voice read Tamil script — it produces garbled
-    // pronunciation. If no genuine ta* voice exists, skip straight to English.
-    let nextLang = announceLanguageRef.current
-    if (nextLang === "ta" && !pickVoice("ta")) {
-      setTamilVoiceMissing(true)
-      nextLang = "en"
-    }
-    // Flip for whichever call comes next (including recalls).
-    announceLanguageRef.current = nextLang === "ta" ? "en" : "ta"
-
-    const queue: { text: string; lang: string }[] = [
-      { text: nextLang === "ta" ? tamil : english, lang: nextLang === "ta" ? "ta-IN" : "en-IN" },
+    // Build + preload the whole queue before playback begins to avoid any
+    // audible gap while files download mid-sequence.
+    const sources = [
+      "/audio/ta/token-num.mp3",
+      `/audio/ta/num-${tokenNumber}.mp3`,
+      "/audio/ta/please-proceed.mp3",
     ]
+    const queue = sources.map((src) => new Audio(src))
+    queue.forEach((audio) => audio.load())
 
-    const speakAt = (i: number) => {
+    const playNext = (i: number) => {
       if (i >= queue.length) return
-      const { text, lang } = queue[i]
-      const u = new SpeechSynthesisUtterance(text)
-      u.lang = lang
-      u.rate = 0.85
-      u.pitch = 1
-      const v = pickVoice(lang.slice(0, 2))
-      if (v) u.voice = v
-      u.onend = () => speakAt(i + 1)
-      // If a voice errors out, still advance so the sequence never stalls.
-      u.onerror = () => speakAt(i + 1)
-      window.speechSynthesis.speak(u)
+      const audio = queue[i]
+      audio.onended = () => playNext(i + 1)
+      // If a clip fails to load/decode, still advance so the sequence never stalls.
+      audio.onerror = () => playNext(i + 1)
+      audio.play().catch(() => playNext(i + 1))
     }
 
-    // Play a short chime, then run the sequence.
+    // Play a short chime, then run the sequence after the same 450ms delay.
     playChime()
-    window.speechSynthesis.cancel()
-    setTimeout(() => speakAt(0), 450)
+    setTimeout(() => playNext(0), 450)
   }, [])
 
   // Watch the dispatch counter; announce whenever it is called — a NEW token
@@ -218,11 +167,13 @@ export function DisplayBoard() {
 
   const enableSound = () => {
     setSoundOn(true)
-    // Unlock speech synthesis + audio with this user gesture.
+    // Unlock <audio> playback with this user gesture — Chrome/Silk block
+    // autoplay without one. Play a real short clip so subsequent announcements
+    // aren't blocked.
     try {
-      const u = new SpeechSynthesisUtterance(" ")
-      u.volume = 0
-      window.speechSynthesis.speak(u)
+      const unlock = new Audio("/audio/ta/please-proceed.mp3")
+      unlock.volume = 0
+      unlock.play().catch(() => {})
     } catch {
       // ignore
     }
@@ -266,11 +217,6 @@ export function DisplayBoard() {
           </div>
         </div>
         <div className="flex items-center gap-6">
-          {tamilVoiceMissing ? (
-            <div className="max-w-[260px] rounded-lg bg-amber-50 px-3 py-2 text-xs font-semibold leading-snug text-amber-700 ring-1 ring-amber-200">
-              Tamil voice not installed on this device — announcements will play in English only
-            </div>
-          ) : null}
           {!soundOn ? (
             <button
               type="button"
