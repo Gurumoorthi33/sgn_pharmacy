@@ -94,13 +94,21 @@ export function DisplayBoard() {
   // later via new Audio() stay muted. Both systems share one context so the
   // unlock gesture covers everything.
   const getAudioContext = useCallback(() => {
-    if (audioCtxRef.current) return audioCtxRef.current
+    if (audioCtxRef.current) {
+      console.log("[audio] getAudioContext: reusing existing ctx, state =", audioCtxRef.current.state)
+      return audioCtxRef.current
+    }
     const WebkitAudioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
     const Ctx = window.AudioContext || WebkitAudioWindow.webkitAudioContext
-    if (!Ctx) return null
+    if (!Ctx) {
+      console.error("[audio] getAudioContext: no AudioContext or webkitAudioContext available")
+      return null
+    }
     try {
       audioCtxRef.current = new Ctx()
-    } catch {
+      console.log("[audio] getAudioContext: created NEW ctx, state =", audioCtxRef.current.state)
+    } catch (err) {
+      console.error("[audio] getAudioContext: failed to create ctx:", err)
       audioCtxRef.current = null
     }
     return audioCtxRef.current
@@ -109,7 +117,11 @@ export function DisplayBoard() {
   // Play a two-note chime on the shared AudioContext.
   const playChime = useCallback(() => {
     const ctx = getAudioContext()
-    if (!ctx) return
+    if (!ctx) {
+      console.warn("[audio] playChime: no AudioContext, aborting")
+      return
+    }
+    console.log("[audio] playChime: ctx.state =", ctx.state, "ctx.currentTime =", ctx.currentTime)
     const notes = [880, 1174]
     notes.forEach((freq, i) => {
       const osc = ctx.createOscillator()
@@ -122,6 +134,7 @@ export function DisplayBoard() {
       gain.gain.setValueAtTime(0.0001, start)
       gain.gain.exponentialRampToValueAtTime(0.3, start + 0.02)
       gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35)
+      console.log("[audio] playChime: scheduling note", i, "freq =", freq, "start =", start)
       osc.start(start)
       osc.stop(start + 0.36)
     })
@@ -155,6 +168,8 @@ export function DisplayBoard() {
     const ctx = getAudioContext()
     if (!ctx) return
 
+    void playChime()
+
     const paths = [
       "/audio/ta/token-num.mp3",
       `/audio/ta/num-${tokenNumber}.mp3`,
@@ -163,7 +178,10 @@ export function DisplayBoard() {
     const buffers = paths
       .map((p) => audioBuffersRef.current.get(p))
       .filter(Boolean) as AudioBuffer[]
-    if (buffers.length === 0) return
+    if (buffers.length === 0) {
+      console.warn("[audio] announceDispatch: buffers not ready, chime only")
+      return
+    }
 
     const playNext = (i: number) => {
       if (i >= buffers.length) return
@@ -174,7 +192,6 @@ export function DisplayBoard() {
       source.start()
     }
 
-    playChime()
     setTimeout(() => playNext(0), 450)
   }, [playChime, getAudioContext])
 
@@ -200,27 +217,37 @@ export function DisplayBoard() {
   }, [rows, soundOn, announceDispatch])
 
   const enableSound = () => {
-    setSoundOn(true)
+    console.log("[audio] enableSound: user gesture fired")
     // MUST be first, synchronous, no async work before this block. Silk
     // invalidates the trusted user gesture the moment an await occurs before
     // the audio unlock completes, so create + resume the shared AudioContext
     // up front with zero async work, then play the chime as part of the same
-    // uninterrupted synchronous block. Any rejects are swallowed so this
-    // sequence can never stall.
+    // uninterrupted synchronous block.
     const ctx = getAudioContext()
-    try {
-      if (ctx && ctx.state === "suspended") {
-        ctx.resume().catch(() => {})
+    if (ctx) {
+      console.log("[audio] enableSound: ctx.state BEFORE resume =", ctx.state)
+      try {
+        const p = ctx.resume()
+        console.log("[audio] enableSound: ctx.resume() returned promise")
+        p.then(
+          () => console.log("[audio] enableSound: ctx.resume() RESOLVED, state =", ctx.state),
+          (err) => console.error("[audio] enableSound: ctx.resume() REJECTED:", err),
+        )
+      } catch (err) {
+        console.error("[audio] enableSound: resume threw:", err)
       }
-    } catch {
-      // ignore
+    } else {
+      console.warn("[audio] enableSound: no AudioContext available")
     }
-    // Chime first — proves the context unlocked on-device. No await before the
-    // oscillators start; both notes are scheduled synchronously.
+    // Chime first — proves the context unlocked on-device.
     playChime()
-    // Async fetch/decode of MP3 buffers runs AFTER the unlock+chime block, as
-    // a separate non-blocking step — never preceding or interleaved with it.
-    preloadAudioBuffers()
+    // setSoundOn AFTER oscillators are scheduled — React state dispatch
+    // schedules a render that runs on the microtask queue; on Silk this can
+    // interrupt the synchronous gesture processing. Doing it last preserves
+    // the uninterrupted audio-unlock block.
+    setSoundOn(true)
+    // Async fetch/decode of MP3 buffers runs AFTER the unlock+chime block.
+    void preloadAudioBuffers()
   }
 
   const timeText = now
