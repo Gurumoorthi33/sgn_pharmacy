@@ -1,0 +1,6 @@
+# Dependencies for scripts/generate-tts-audio.py
+#   pip install -r scripts/requirements.txt
+gTTS>=2.5
+pydub>=0.25
+imageio-ffmpeg>=0.4
+static-ffmpeg>=3.0

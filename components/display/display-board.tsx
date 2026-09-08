@@ -147,9 +147,9 @@ export function DisplayBoard() {
     const ctx = getAudioContext()
     if (!ctx) return
     const paths = [
-      "/audio/ta/token-num.mp3",
-      "/audio/ta/please-proceed.mp3",
-      ...Array.from({ length: 100 }, (_, i) => `/audio/ta/num-${i}.mp3`),
+      "/audio/ta/token-num.wav",
+      "/audio/ta/please-proceed.wav",
+      ...Array.from({ length: 100 }, (_, i) => `/audio/ta/num-${i}.wav`),
     ]
     await Promise.allSettled(
       paths.map(async (path) => {
@@ -178,9 +178,9 @@ export function DisplayBoard() {
     void playChime()
 
     const paths = [
-      "/audio/ta/token-num.mp3",
-      `/audio/ta/num-${tokenNumber}.mp3`,
-      "/audio/ta/please-proceed.mp3",
+      "/audio/ta/token-num.wav",
+      `/audio/ta/num-${tokenNumber}.wav`,
+      "/audio/ta/please-proceed.wav",
     ]
     const buffers = paths
       .map((p) => audioBuffersRef.current.get(p))
