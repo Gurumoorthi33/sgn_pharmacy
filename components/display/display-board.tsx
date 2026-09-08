@@ -48,9 +48,12 @@ export function DisplayBoard() {
   const [now, setNow] = useState<Date | null>(null)
   const [soundOn, setSoundOn] = useState(false)
   const lastDispatchCallRef = useRef<string | null>(null)
+  const lastEntryCallRefs = useRef<Record<number, string | null>>({})
+  const entryInitializedRef = useRef<Set<number>>(new Set())
   const initializedRef = useRef(false)
   const audioCtxRef = useRef<AudioContext | null>(null)
   const announceAudioRef = useRef<HTMLAudioElement | null>(null)
+  const entryAudioRefs = useRef<Record<number, HTMLAudioElement | null>>({})
 
   // Load + subscribe to the live board
   useEffect(() => {
@@ -175,6 +178,41 @@ export function DisplayBoard() {
     [playChime],
   )
 
+  // Announce an entry-counter call by playing the single pre-rendered Tamil
+  // announcement for that (counter, token) via a per-counter <audio> element.
+  // Counter calls can overlap in time (unlike the single dispatch counter), so
+  // each counter has its own primed element — sharing one element across
+  // counters would abort the first announcement when a second counter calls
+  // near-simultaneously. Same pattern as announceDispatch: chime first, then
+  // after 450ms set src → load() → play() on the reused element, guarded by
+  // !paused to prevent the AbortError race.
+  const announceEntry = useCallback(
+    (counterNumber: number, tokenNumber: number) => {
+      void playChime()
+      setTimeout(() => {
+        const audio = entryAudioRefs.current[counterNumber]
+        if (audio && !audio.paused) {
+          console.log(
+            "[audio] duplicate announceEntry call ignored for counter",
+            counterNumber,
+            "token",
+            tokenNumber,
+          )
+          return
+        }
+        if (!audio) {
+          console.error("[audio] announceEntry: no audio element mounted for counter", counterNumber)
+          return
+        }
+        const path = `/audio/ta/entry/counter-${counterNumber}-token-${tokenNumber}.mp3`
+        audio.setAttribute("src", path)
+        audio.load()
+        audio.play().catch((err) => console.error("[audio] entry announcement playback failed:", err))
+      }, 450)
+    },
+    [playChime],
+  )
+
   // Watch the dispatch counter; announce whenever it is called — a NEW token
   // OR the same token re-called ("Call again"). We key off dispatch_called_at,
   // which changes on every call and every recall.
@@ -198,6 +236,36 @@ export function DisplayBoard() {
       if (soundOn) void announceDispatch(current)
     }
   }, [rows, soundOn, announceDispatch])
+
+  // Watch the entry counters (1-4); announce whenever any one of them is
+  // called — a NEW token OR the same token re-called. Keyed off each entry
+  // counter's own called_at, which changes on every call and recall. Uses a
+  // per-counter ref (not a single shared ref) because the four counters are
+  // independent. Same synchronous-ref-update dedup as the dispatch effect to
+  // close the realtime-vs-polling duplicate-trigger race.
+  useEffect(() => {
+    const entryRows = rows.filter((r) => r.station === "entry" && r.counter != null)
+    for (const row of entryRows) {
+      const counter = row.counter!
+      const current = row.token_number
+      const calledAt = row.called_at
+
+      if (!entryInitializedRef.current.has(counter)) {
+        // First sighting of this counter — record what's already on screen and
+        // skip announcing it, independently per counter (orders it may come in).
+        lastEntryCallRefs.current[counter] = calledAt
+        entryInitializedRef.current.add(counter)
+        continue
+      }
+
+      if (current !== null && calledAt !== null && calledAt !== lastEntryCallRefs.current[counter]) {
+        // Update the ref synchronously BEFORE calling announceEntry so a
+        // polling check a few ms later sees the updated value and skips.
+        lastEntryCallRefs.current[counter] = calledAt
+        if (soundOn) void announceEntry(counter, current)
+      }
+    }
+  }, [rows, soundOn, announceEntry])
 
   const enableSound = () => {
     console.log("[audio] enableSound: user gesture fired")
@@ -238,7 +306,21 @@ export function DisplayBoard() {
         sourceUrl: `/audio/ta/announcement-5.mp3`,
       })
     } else {
-      console.warn("[audio] enableSound: no audio element mounted yet to unlock")
+      console.warn("[audio] enableSound: no dispatch audio element mounted yet to unlock")
+    }
+
+    // Prime each entry-counter audio element onto its own hardware channel,
+    // exactly like the dispatch element above, so near-simultaneous calls
+    // across counters each play on an already-primed channel.
+    for (const counter of [1, 2, 3, 4]) {
+      const entryMedia = entryAudioRefs.current[counter]
+      if (entryMedia) {
+        void unlockAndPlay({
+          audioElement: entryMedia,
+          audioContext: ctx,
+          sourceUrl: `/audio/ta/entry/counter-${counter}-token-1.mp3`,
+        })
+      }
     }
 
     // setSoundOn AFTER oscillators are scheduled — React state dispatch
@@ -292,6 +374,26 @@ export function DisplayBoard() {
         <source src="/audio/ta/announcement-5.mp3" type="audio/mpeg" />
         <source src="/audio/ta/announcement-50.mp3" type="audio/mpeg" />
       </audio>
+
+      {/* Per-counter entry announcement players. One primed <audio> element per
+          entry counter so calls at different counters can play near-simultaneously
+          without one aborting another on the shared element. Same TV-browser
+          media attributes as the dispatch player. */}
+      {[1, 2, 3, 4].map((counter) => (
+        <audio
+          key={counter}
+          ref={(el) => {
+            entryAudioRefs.current[counter] = el
+          }}
+          preload="auto"
+          playsInline
+          crossOrigin="anonymous"
+          className="hidden"
+        >
+          <source src={`/audio/ta/entry/counter-${counter}-token-1.mp3`} type="audio/mpeg" />
+          <source src={`/audio/ta/entry/counter-${counter}-token-2.mp3`} type="audio/mpeg" />
+        </audio>
+      ))}
 
       {/* Header */}
       <header className="flex items-center justify-between gap-4 border-b-2 border-black/10 px-8 py-4">

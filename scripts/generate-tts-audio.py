@@ -28,8 +28,9 @@ Requirements:
 Usage:
     python scripts/generate-tts-audio.py
 
-Generated files (tokens 0-99):
+Generated files (tokens 0-99 dispatch + entry counters 1-4, tokens 1-300):
     public/audio/ta/announcement-{0..99}.mp3
+    public/audio/ta/entry/counter-{1..4}-token-{1..300}.mp3
 """
 
 import io
@@ -60,8 +61,20 @@ ANNOUNCEMENT_TEMPLATE = (
     "தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
 )
 
+# Entry-counter full sentence, per (counter, token) as one continuous clip.
+# One file per combination — never chained/segmented clips, matching the
+# Dispatch approach that proved reliable on TV browsers.
+ENTRY_ANNOUNCEMENT_TEMPLATE = (
+    "Token எண் {token_number}, "
+    "நுழைவு கவுண்டர் {counter_number}-க்கு வரவும்"
+)
+
 # 0 and 99 included, though max single-day count is realistically far lower.
 MAX_NUM = 99
+
+# Entry counters 1-4, tokens 1-300.
+ENTRY_COUNTERS = range(1, 5)
+ENTRY_MAX_TOKEN = 300
 
 
 def generate_announcement(token_number: int) -> None:
@@ -75,13 +88,34 @@ def generate_announcement(token_number: int) -> None:
     print(f"wrote {path.relative_to(Path.cwd())}")
 
 
+def generate_entry_announcement(counter_number: int, token_number: int) -> None:
+    text = ENTRY_ANNOUNCEMENT_TEMPLATE.format(
+        counter_number=counter_number, token_number=token_number
+    )
+    mp3_buffer = io.BytesIO()
+    gTTS(text=text, lang="ta").write_to_fp(mp3_buffer)
+    mp3_buffer.seek(0)
+    audio = AudioSegment.from_mp3(mp3_buffer)
+    entry_dir = OUTPUT_DIR / "entry"
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    path = entry_dir / f"counter-{counter_number}-token-{token_number}.mp3"
+    audio.export(str(path), format="mp3", bitrate="96k", parameters=["-ar", "44100"])
+    print(f"wrote {path.relative_to(Path.cwd())}")
+
+
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for i in range(MAX_NUM + 1):
         generate_announcement(i)
 
-    print(f"done — {MAX_NUM + 1} announcement mp3 files written to {OUTPUT_DIR}")
+    for counter in ENTRY_COUNTERS:
+        for token in range(1, ENTRY_MAX_TOKEN + 1):
+            generate_entry_announcement(counter, token)
+
+    print(
+        f"done — {MAX_NUM + 1} dispatch + {len(list(ENTRY_COUNTERS)) * ENTRY_MAX_TOKEN} entry mp3 files written to {OUTPUT_DIR}"
+    )
 
 
 if __name__ == "__main__":
