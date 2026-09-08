@@ -58,3 +58,19 @@ export async function callEntryTokenAction(
     return { error: (e as Error).message }
   }
 }
+
+// Re-announce the token currently being served at this counter (fresh
+// entry_recalled_at re-triggers the voice). Does NOT advance the queue or
+// mutate entry_called_at — purely a re-announce signal.
+export async function recallEntryAction(
+  id: string,
+): Promise<{ token?: Token | null; error?: string }> {
+  try {
+    const supabase = await client()
+    const { data, error } = await supabase.rpc("recall_entry", { p_id: id })
+    if (error) return { error: error.message }
+    return { token: data as Token | null }
+  } catch (e) {
+    return { error: (e as Error).message }
+  }
+}

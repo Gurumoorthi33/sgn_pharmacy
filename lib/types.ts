@@ -17,8 +17,10 @@ export type Token = {
   entry_counter: number | null
   created_at: string
   entry_called_at: string | null
+  entry_recalled_at: string | null
   entry_completed_at: string | null
   payment_called_at: string | null
+  payment_recalled_at: string | null
   payment_completed_at: string | null
   dispatch_called_at: string | null
   dispatch_requeued_at: string | null

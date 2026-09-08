@@ -7,10 +7,11 @@ import {
   completePaymentAction,
   waitAndNextPaymentAction,
   callPaymentTokenAction,
+  recallPaymentAction,
 } from "@/app/payment/actions"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Check, PhoneCall, PauseCircle } from "lucide-react"
+import { Check, PhoneCall, PauseCircle, RotateCcw } from "lucide-react"
 
 export function PaymentBoard() {
   const { tokens, refetch } = useTokens()
@@ -83,15 +84,29 @@ export function PaymentBoard() {
               <Check className="mr-2 h-4 w-4 shrink-0" aria-hidden="true" />
               Complete
             </Button>
-            <Button
-              variant="outline"
-              className="w-full bg-transparent"
-              disabled={pending || !serving}
-              onClick={() => serving && run(() => waitAndNextPaymentAction(serving.id))}
-            >
-              <PauseCircle className="mr-2 h-4 w-4 shrink-0" aria-hidden="true" />
-              Wait &amp; continue
-            </Button>
+            {/* Call Again and Wait & continue sit side-by-side, mirroring Dispatch */}
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                variant="outline"
+                disabled={pending || !serving}
+                onClick={() => serving && run(() => recallPaymentAction(serving.id))}
+              >
+                <RotateCcw className="mr-2 h-4 w-4" aria-hidden="true" />
+                Call again
+              </Button>
+              <Button
+                variant="outline"
+                className="w-full bg-transparent"
+                disabled={pending || !serving}
+                onClick={() => serving && run(() => waitAndNextPaymentAction(serving.id))}
+              >
+                <PauseCircle className="mr-2 h-4 w-4 shrink-0" aria-hidden="true" />
+                Wait &amp; continue
+              </Button>
+            </div>
+            <p className="text-center text-xs text-muted-foreground">
+              {"Call again re-announces the token. Wait & continue parks it and calls the next patient."}
+            </p>
           </div>
         </CardContent>
       </Card>

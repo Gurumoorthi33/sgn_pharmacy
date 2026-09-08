@@ -1,11 +1,16 @@
 "use client"
 
 import { useTransition } from "react"
-import { callNextEntryAction, completeEntryAction, waitAndNextEntryAction } from "@/app/entry/actions"
+import {
+  callNextEntryAction,
+  completeEntryAction,
+  waitAndNextEntryAction,
+  recallEntryAction,
+} from "@/app/entry/actions"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import type { Token } from "@/lib/types"
-import { Check, PhoneCall, PauseCircle } from "lucide-react"
+import { Check, PhoneCall, PauseCircle, RotateCcw } from "lucide-react"
 
 export function EntryCounterCard({
   counter,
@@ -66,15 +71,29 @@ export function EntryCounterCard({
             <Check className="mr-2 h-4 w-4 shrink-0" aria-hidden="true" />
             Complete
           </Button>
-          <Button
-            variant="outline"
-            className="w-full bg-transparent"
-            disabled={pending || !serving}
-            onClick={() => serving && run(() => waitAndNextEntryAction(serving.id, counter))}
-          >
-            <PauseCircle className="mr-2 h-4 w-4 shrink-0" aria-hidden="true" />
-            Wait &amp; continue
-          </Button>
+          {/* Call Again and Wait & continue sit side-by-side, mirroring Dispatch */}
+          <div className="grid grid-cols-2 gap-2">
+            <Button
+              variant="outline"
+              disabled={pending || !serving}
+              onClick={() => serving && run(() => recallEntryAction(serving.id))}
+            >
+              <RotateCcw className="mr-2 h-4 w-4" aria-hidden="true" />
+              Call again
+            </Button>
+            <Button
+              variant="outline"
+              className="bg-transparent"
+              disabled={pending || !serving}
+              onClick={() => serving && run(() => waitAndNextEntryAction(serving.id, counter))}
+            >
+              <PauseCircle className="mr-2 h-4 w-4 shrink-0" aria-hidden="true" />
+              Wait &amp; continue
+            </Button>
+          </div>
+          <p className="text-center text-xs text-muted-foreground">
+            {"Call again re-announces the token. Wait & continue parks it and calls the next patient."}
+          </p>
         </div>
       </CardContent>
     </Card>

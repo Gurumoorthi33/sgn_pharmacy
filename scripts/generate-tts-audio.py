@@ -5,12 +5,15 @@ Run once manually on a dev machine (not at request-time). Output clips are
 committed to the repo as static assets under public/audio/ta/.
 
 Each token number gets ONE continuous file containing the full sentence:
-    "Token எண் {N}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
-e.g. announcement-5.mp3 = "Token எண் 5, தயவுசெய்து ...". The display board
-plays a single element per announcement — no multi-clip chaining needed.
+    Dispatch:  "Token எண் {N}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
+    Entry:     "Token எண் {N}, நுழைவு கவுண்டர் {C}-க்கு வரவும்"
+    Payment:   "Token எண் {N}, தயவுசெய்து பணம் செலுத்தும் கவுண்டருக்கு வரவும்"
+
+The display board plays a single element per announcement — no multi-clip
+chaining needed.
 
 gTTS emits MP3 directly, which we normalize through pydub to a fixed moderate
-bitrate suited for spoken word. MP3 is confirmed supported by Amazon Silk's
+bitrate suited for spoken word.  MP3 is confirmed supported by Amazon Silk's
 official documentation (same as WAV), and the much smaller file size reduces
 load time on slower TV hardware, shrinking the window in which audio race
 conditions can occur.
@@ -28,9 +31,16 @@ Requirements:
 Usage:
     python scripts/generate-tts-audio.py
 
-Generated files (tokens 0-99 dispatch + entry counters 1-4, tokens 1-300):
-    public/audio/ta/announcement-{0..99}.mp3
-    public/audio/ta/entry/counter-{1..4}-token-{1..300}.mp3
+Generated files:
+    public/audio/ta/announcement-{0..99}.mp3            (dispatch, 100 files)
+    public/audio/ta/entry/counter-{1..4}-token-{1..300}.mp3  (entry, 1200 files)
+    public/audio/ta/payment/token-{1..300}.mp3          (payment, 300 files)
+
+Vercel static asset note:
+    ~81 MB entry + ~21 MB payment + ~7 MB dispatch ≈ 109 MB total.
+    Vercel's public/ directory is served via CDN with no enforced size limit on
+    static files; only the serverless function bundle has a 250 MB limit (which
+    excludes public/). This is well within normal CDN deployment limits.
 """
 
 import io
@@ -55,26 +65,37 @@ AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "public" / "audio" / "ta"
 
+# ── Dispatch ─────────────────────────────────────────────────────────────────
 # Full sentence, pre-rendered per token number as one continuous clip.
 ANNOUNCEMENT_TEMPLATE = (
     "Token எண் {token_number}, "
     "தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
 )
 
-# Entry-counter full sentence, per (counter, token) as one continuous clip.
-# One file per combination — never chained/segmented clips, matching the
-# Dispatch approach that proved reliable on TV browsers.
+# 0 and 99 included, though max single-day count is realistically far lower.
+MAX_NUM = 99
+
+# ── Entry ─────────────────────────────────────────────────────────────────────
+# One file per (counter, token) combination.
 ENTRY_ANNOUNCEMENT_TEMPLATE = (
     "Token எண் {token_number}, "
     "நுழைவு கவுண்டர் {counter_number}-க்கு வரவும்"
 )
 
-# 0 and 99 included, though max single-day count is realistically far lower.
-MAX_NUM = 99
-
 # Entry counters 1-4, tokens 1-300.
 ENTRY_COUNTERS = range(1, 5)
 ENTRY_MAX_TOKEN = 300
+
+# ── Payment ───────────────────────────────────────────────────────────────────
+# One file per token number.
+# Phrase: "Token எண் {N}, தயவுசெய்து பணம் செலுத்தும் கவுண்டருக்கு வரவும்"
+# English: "Token number N, please come to the payment counter."
+PAYMENT_ANNOUNCEMENT_TEMPLATE = (
+    "Token எண் {token_number}, "
+    "தயவுசெய்து பணம் செலுத்தும் கவுண்டருக்கு வரவும்"
+)
+
+PAYMENT_MAX_TOKEN = 300
 
 
 def generate_announcement(token_number: int) -> None:
@@ -103,18 +124,39 @@ def generate_entry_announcement(counter_number: int, token_number: int) -> None:
     print(f"wrote {path.relative_to(Path.cwd())}")
 
 
+def generate_payment_announcement(token_number: int) -> None:
+    text = PAYMENT_ANNOUNCEMENT_TEMPLATE.format(token_number=token_number)
+    mp3_buffer = io.BytesIO()
+    gTTS(text=text, lang="ta").write_to_fp(mp3_buffer)
+    mp3_buffer.seek(0)
+    audio = AudioSegment.from_mp3(mp3_buffer)
+    payment_dir = OUTPUT_DIR / "payment"
+    payment_dir.mkdir(parents=True, exist_ok=True)
+    path = payment_dir / f"token-{token_number}.mp3"
+    audio.export(str(path), format="mp3", bitrate="96k", parameters=["-ar", "44100"])
+    print(f"wrote {path.relative_to(Path.cwd())}")
+
+
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    print("=== Generating dispatch announcements (0–99) ===")
     for i in range(MAX_NUM + 1):
         generate_announcement(i)
 
+    print("\n=== Generating entry announcements (counters 1–4, tokens 1–300) ===")
     for counter in ENTRY_COUNTERS:
         for token in range(1, ENTRY_MAX_TOKEN + 1):
             generate_entry_announcement(counter, token)
 
+    print("\n=== Generating payment announcements (tokens 1–300) ===")
+    for token in range(1, PAYMENT_MAX_TOKEN + 1):
+        generate_payment_announcement(token)
+
     print(
-        f"done — {MAX_NUM + 1} dispatch + {len(list(ENTRY_COUNTERS)) * ENTRY_MAX_TOKEN} entry mp3 files written to {OUTPUT_DIR}"
+        f"\ndone — {MAX_NUM + 1} dispatch + "
+        f"{len(list(ENTRY_COUNTERS)) * ENTRY_MAX_TOKEN} entry + "
+        f"{PAYMENT_MAX_TOKEN} payment mp3 files written to {OUTPUT_DIR}"
     )
 
 

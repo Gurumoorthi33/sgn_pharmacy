@@ -12,13 +12,19 @@ type DisplayRow = {
   counter: number | null
   token_number: number
   called_at: string | null
+  // Recall signals — updated by recall_entry / recall_payment / recall_dispatch
+  // RPCs without changing the token number. The display watcher keys off these
+  // to re-announce without duplicating the number-change trigger.
+  recalled_at: string | null
 }
 
-// One unit of work for the global FIFO audio queue. Dispatch announcements
-// carry no counter; Entry announcements carry the counter they came from.
+// One unit of work for the global FIFO audio queue.
+// - dispatch: /audio/ta/announcement-{N}.mp3
+// - entry:    /audio/ta/entry/counter-{C}-token-{N}.mp3
+// - payment:  /audio/ta/payment/token-{N}.mp3
 type QueueItem = {
-  type: "dispatch" | "entry"
-  counterNumber?: number
+  type: "dispatch" | "entry" | "payment"
+  counterNumber?: number // only for entry
   tokenNumber: number
 }
 
@@ -55,10 +61,25 @@ export function DisplayBoard() {
   const [lang, setLang] = useState<Lang>("en")
   const [now, setNow] = useState<Date | null>(null)
   const [soundOn, setSoundOn] = useState(false)
+
+  // Dispatch: keyed off called_at (changes on every call AND recall)
   const lastDispatchCallRef = useRef<string | null>(null)
+  const dispatchInitializedRef = useRef(false)
+
+  // Entry: number-change trigger (one ref per counter)
   const lastEntryNumberRefs = useRef<Record<number, number | null>>({})
   const entryInitializedRef = useRef<Set<number>>(new Set())
-  const initializedRef = useRef(false)
+
+  // Entry: recall trigger (one ref per counter — keyed off recalled_at)
+  const lastEntryRecallRefs = useRef<Record<number, string | null>>({})
+
+  // Payment: number-change trigger (mirrors entry pattern)
+  const lastPaymentNumberRef = useRef<number | null>(null)
+  const paymentInitializedRef = useRef(false)
+
+  // Payment: recall trigger (keyed off recalled_at)
+  const lastPaymentRecallRef = useRef<string | null>(null)
+
   const audioCtxRef = useRef<AudioContext | null>(null)
   const sharedAudioRef = useRef<HTMLAudioElement | null>(null)
   const audioQueueRef = useRef<QueueItem[]>([])
@@ -93,7 +114,6 @@ export function DisplayBoard() {
   }, [])
 
   // Clock: avoid hydration mismatches by waiting until the client has mounted
-  // before rendering the real time value.
   useEffect(() => {
     const updateNow = () => setNow(new Date())
     updateNow()
@@ -102,10 +122,7 @@ export function DisplayBoard() {
   }, [])
 
   // Lazily create or return the single AudioContext shared by the chime and
-  // announcement playback. Silk on Fire TV only propagates an audio-unlock
-  // gesture to the AudioContext that was active at click-time — HTMLMediaElements
-  // created later via new Audio() stay muted. Both systems share one context so
-  // the unlock gesture covers everything.
+  // announcement playback.
   const getAudioContext = useCallback(() => {
     if (audioCtxRef.current) {
       console.log("[audio] getAudioContext: reusing existing ctx, state =", audioCtxRef.current.state)
@@ -153,42 +170,36 @@ export function DisplayBoard() {
     })
   }, [getAudioContext])
 
-  // Global FIFO audio queue. Every announcement — Dispatch AND all Entry
-  // Counters — is pushed here and played strictly one-at-a-time (chime +
-  // speech as one unit). Only one clip plays at any moment system-wide; the
-  // rest wait their turn, so near-simultaneous calls across counters never
-  // overlap or talk over each other.
-  //
-  // processQueue re-invokes itself from async handlers (onended, catch,
-  // deferral timer); those calls go through processQueueRef so we never
-  // reference the callback before its declaration (avoids TDZ/immutability
-  // lint errors and always calls the latest closure).
+  // Global FIFO audio queue. Every announcement — Dispatch, Entry, AND Payment —
+  // is pushed here and played strictly one-at-a-time (chime + speech as one unit).
   const processQueueRef = useRef<() => void>(() => {})
   const processQueue = useCallback(() => {
     const audio = sharedAudioRef.current
-    if (isPlayingRef.current) return // something's playing — pickup on onended
+    if (isPlayingRef.current) return
     if (!audio) {
       console.error("[audio] processQueue: no shared audio element mounted")
       return
     }
     const next = audioQueueRef.current.shift()
-    if (!next) return // queue empty
+    if (!next) return
 
     isPlayingRef.current = true
     console.log("[audio] processQueue: playing", next, "queue =", audioQueueRef.current.length)
 
     void playChime()
     setTimeout(() => {
+      // Resolve the pre-generated MP3 path for each station type.
       const path =
         next.type === "dispatch"
           ? `/audio/ta/announcement-${next.tokenNumber}.mp3`
-          : `/audio/ta/entry/counter-${next.counterNumber}-token-${next.tokenNumber}.mp3`
+          : next.type === "payment"
+            ? `/audio/ta/payment/token-${next.tokenNumber}.mp3`
+            : `/audio/ta/entry/counter-${next.counterNumber}-token-${next.tokenNumber}.mp3`
+      console.log("[audio] processQueue: item type =", next.type, "resolved path =", path)
 
-      // Belt-and-suspenders: if the shared element somehow ended up mid-play
-      // (e.g. the 450ms window overlapped another sheet), skip this one rather
-      // than reassigning .src under a pending play() — reassignment is what
-      // causes the AbortError on TV WebKit. This is a safety net; the queue
-      // itself should already guarantee only one active .play() at a time.
+      // Belt-and-suspenders: if the shared element somehow ended up mid-play,
+      // defer rather than reassigning .src under a pending play() — that is
+      // what causes AbortError on TV WebKit.
       if (!audio.paused) {
         console.log("[audio] processQueue: shared element busy, deferring", next)
         audioQueueRef.current.unshift(next)
@@ -207,23 +218,19 @@ export function DisplayBoard() {
 
       audio.onended = () => {
         isPlayingRef.current = false
-        processQueueRef.current() // immediately check for and play the next queued item
+        processQueueRef.current()
       }
     }, 450)
   }, [playChime])
 
   // Keep the latest processQueue closure accessible to its own async handlers.
-  // Must be in an effect (refs cannot be updated during render). All re-invocations
-  // of processQueue happen asynchronously (onended / catch / deferral timer), so by
-  // the time any of them runs, this effect has already run.
   useEffect(() => {
     processQueueRef.current = processQueue
   }, [processQueue])
 
   // Push an announcement onto the global queue and kick the sequential player.
   // Includes a queue-size safety cap: if the pending queue exceeds the cap,
-  // drop the oldest excess entry (rather than letting stale announcements pile
-  // up and play minutes late) and log a warning.
+  // drop the oldest excess entry and log a warning.
   const enqueueAnnouncement = useCallback(
     (item: QueueItem) => {
       const MAX_PENDING = 12
@@ -237,71 +244,161 @@ export function DisplayBoard() {
     [processQueue],
   )
 
-  // Watch the dispatch counter; announce whenever it is called — a NEW token
-  // OR the same token re-called ("Call again"). We key off dispatch_called_at,
-  // which changes on every call and every recall.
+  // ─── DISPATCH WATCHER ────────────────────────────────────────────────────
+  // Watch the dispatch counter; announce whenever called_at changes — a NEW
+  // token OR the same token re-called ("Call again").
   useEffect(() => {
     const dispatch = rows.find((r) => r.station === "dispatch")
     const current = dispatch?.token_number ?? null
     const calledAt = dispatch?.called_at ?? null
 
-    if (!initializedRef.current) {
-      // Don't announce whatever was already on screen when the board first loads.
+    if (!dispatchInitializedRef.current) {
       lastDispatchCallRef.current = calledAt
-      initializedRef.current = true
+      dispatchInitializedRef.current = true
       return
     }
 
     if (current !== null && calledAt !== null && calledAt !== lastDispatchCallRef.current) {
-      // Update the ref synchronously, BEFORE enqueueing, so that if the polling
-      // check runs a few ms later (before the queue processes it) it already
-      // sees the updated value and skips the second trigger.
       lastDispatchCallRef.current = calledAt
       if (soundOn) enqueueAnnouncement({ type: "dispatch", tokenNumber: current })
     }
   }, [rows, soundOn, enqueueAnnouncement])
 
-  // Watch the entry counters; announce whenever any one of them shows a NEW
-  // "now serving" token number. Entry Counters have NO recall/"Call Again"
-  // button — a token is announced exactly once, when its number first appears.
-  // So we key off the displayed token_number itself: a change in that number
-  // IS the only trigger. Re-displaying the same number does nothing (this
-  // naturally replaces any recall concept — there is none for entry counters).
-  //
-  // Per-counter ref (not shared) since each counter's number changes
-  // independently. Same synchronous-ref-update dedup as the dispatch effect to
-  // close the realtime-vs-polling duplicate-trigger race.
+  // ─── ENTRY NUMBER-CHANGE WATCHER ─────────────────────────────────────────
+  // Watch each entry counter; announce whenever its token_number changes to a
+  // NEW value. This is the primary trigger (new call / held-token recall).
+  // Does NOT update lastEntryRecallRefs — that ref is only touched by the
+  // recall watcher below, so the two triggers stay independent.
   useEffect(() => {
     const entryRows = rows.filter((r) => r.station === "entry" && r.counter != null)
+    console.log("[entry-watch] rows for entry stations:", entryRows)
     for (const row of entryRows) {
-      const counter = row.counter!
+      const counter = Number(row.counter!)
       const current = row.token_number
 
+      console.log(
+        `[entry-watch] counter ${counter}: current=${current}, lastAnnounced=${lastEntryNumberRefs.current[counter]}`,
+      )
+
       if (!entryInitializedRef.current.has(counter)) {
-        // First sighting of this counter — record what's already showing and
-        // skip announcing it, independently per counter (whatever order the
-        // rows arrive in).
         lastEntryNumberRefs.current[counter] = current
         entryInitializedRef.current.add(counter)
+        console.log(`[entry-watch] counter ${counter}: initialized, baseline=${current}`)
         continue
       }
 
       if (current !== null && current !== lastEntryNumberRefs.current[counter]) {
-        // Update the ref synchronously BEFORE enqueueing so a polling check a
-        // few ms later sees the new value and skips.
+        // Synchronous ref update before enqueue — closes the realtime-vs-polling
+        // duplicate-trigger race.
         lastEntryNumberRefs.current[counter] = current
+        console.log(
+          `[entry-watch] enqueueing:`,
+          { type: "entry", counterNumber: counter, tokenNumber: current },
+          "soundOn =",
+          soundOn,
+        )
         if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current })
       }
     }
   }, [rows, soundOn, enqueueAnnouncement])
 
+  // ─── ENTRY RECALL WATCHER ────────────────────────────────────────────────
+  // Watch each entry counter's recalled_at; re-announce the SAME token when
+  // the staff presses "Call Again". Keys off recalled_at (not token_number),
+  // so it fires even though the number hasn't changed. Does NOT touch
+  // lastEntryNumberRefs, keeping the two triggers completely independent.
+  useEffect(() => {
+    const entryRows = rows.filter((r) => r.station === "entry" && r.counter != null)
+    for (const row of entryRows) {
+      const counter = Number(row.counter!)
+      const current = row.token_number
+      const recalledAt = row.recalled_at ?? null
+
+      // Skip counters we haven't initialized yet (the number-change watcher
+      // handles first-sight initialization).
+      if (!entryInitializedRef.current.has(counter)) continue
+
+      // Initialize the recall ref on first sight of this counter's recalled_at.
+      if (!(counter in lastEntryRecallRefs.current)) {
+        lastEntryRecallRefs.current[counter] = recalledAt
+        continue
+      }
+
+      if (
+        current !== null &&
+        recalledAt !== null &&
+        recalledAt !== lastEntryRecallRefs.current[counter]
+      ) {
+        // Synchronous update before enqueue (same race-condition fix as the
+        // number-change watcher).
+        lastEntryRecallRefs.current[counter] = recalledAt
+        console.log(
+          `[entry-recall] counter ${counter}: re-announcing token ${current} (recalled_at=${recalledAt})`,
+        )
+        // Recall does NOT update lastEntryNumberRefs — the number hasn't
+        // changed, so the number-change watcher should remain unaffected.
+        if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current })
+      }
+    }
+  }, [rows, soundOn, enqueueAnnouncement])
+
+  // ─── PAYMENT NUMBER-CHANGE WATCHER ───────────────────────────────────────
+  // Watch the payment counter; announce whenever its token_number changes to a
+  // NEW value (normal call or held-token recall from the on-hold list).
+  useEffect(() => {
+    const payment = rows.find((r) => r.station === "payment")
+    const current = payment?.token_number ?? null
+
+    if (!paymentInitializedRef.current) {
+      lastPaymentNumberRef.current = current
+      paymentInitializedRef.current = true
+      return
+    }
+
+    if (current !== null && current !== lastPaymentNumberRef.current) {
+      // Synchronous update before enqueue.
+      lastPaymentNumberRef.current = current
+      console.log(`[payment-watch] new token ${current}, enqueueing`)
+      if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current })
+    }
+  }, [rows, soundOn, enqueueAnnouncement])
+
+  // ─── PAYMENT RECALL WATCHER ──────────────────────────────────────────────
+  // Watch the payment counter's recalled_at; re-announce the SAME token when
+  // the staff presses "Call Again". Mirrors the Entry recall pattern exactly.
+  useEffect(() => {
+    const payment = rows.find((r) => r.station === "payment")
+    const current = payment?.token_number ?? null
+    const recalledAt = payment?.recalled_at ?? null
+
+    if (!paymentInitializedRef.current) return // wait for number-change init first
+
+    // Initialize the recall ref on first sight.
+    if (lastPaymentRecallRef.current === null && recalledAt === null) {
+      lastPaymentRecallRef.current = recalledAt
+      return
+    }
+    if (lastPaymentRecallRef.current === null) {
+      lastPaymentRecallRef.current = recalledAt
+      return
+    }
+
+    if (
+      current !== null &&
+      recalledAt !== null &&
+      recalledAt !== lastPaymentRecallRef.current
+    ) {
+      // Synchronous update before enqueue.
+      lastPaymentRecallRef.current = recalledAt
+      console.log(
+        `[payment-recall] re-announcing token ${current} (recalled_at=${recalledAt})`,
+      )
+      if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current })
+    }
+  }, [rows, soundOn, enqueueAnnouncement])
+
   const enableSound = () => {
     console.log("[audio] enableSound: user gesture fired")
-    // MUST be first, synchronous, no async work before this block. Silk
-    // invalidates the trusted user gesture the moment an await occurs before
-    // the audio unlock completes, so create + resume the shared AudioContext
-    // up front with zero async work, then play the chime as part of the same
-    // uninterrupted synchronous block.
     const ctx = getAudioContext()
     if (ctx) {
       console.log("[audio] enableSound: ctx.state BEFORE resume =", ctx.state)
@@ -318,15 +415,8 @@ export function DisplayBoard() {
     } else {
       console.warn("[audio] enableSound: no AudioContext available")
     }
-    // Chime first — proves the context unlocked on-device.
     playChime()
 
-    // Prime the shared HTMLMediaElement onto a hardware channel and prove playback
-    // starts within the gesture. We keep the synchronous AudioContext resume
-    // above intact (some engines invalidate the trusted gesture on the first
-    // await), then run the media unlock after — calling load() before play()
-    // so older TV WebKit engines bind the stream to a hardware channel. One
-    // shared element now serves the whole queue.
     const mediaElement = sharedAudioRef.current
     if (mediaElement) {
       void unlockAndPlay({
@@ -338,10 +428,6 @@ export function DisplayBoard() {
       console.warn("[audio] enableSound: no shared audio element mounted yet to unlock")
     }
 
-    // setSoundOn AFTER oscillators are scheduled — React state dispatch
-    // schedules a render that runs on the microtask queue; on Silk this can
-    // interrupt the synchronous gesture processing. Doing it last preserves
-    // the uninterrupted audio-unlock block.
     setSoundOn(true)
   }
 
