@@ -4,24 +4,20 @@ import Image from "next/image"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createClient } from "@/lib/supabase/client"
 import { HOSPITAL_NAME, SYSTEM_NAME } from "@/lib/types"
-import { unlockAndPlay } from "@/lib/audio-unlock"
-import { Volume2 } from "lucide-react"
+import { Volume2, AlertTriangle } from "lucide-react"
 
 type DisplayRow = {
   station: "entry" | "payment" | "dispatch"
   counter: number | null
   token_number: number
   called_at: string | null
-  // Recall signals — updated by recall_entry / recall_payment / recall_dispatch
-  // RPCs without changing the token number. The display watcher keys off these
-  // to re-announce without duplicating the number-change trigger.
   recalled_at: string | null
 }
 
 // One unit of work for the global FIFO audio queue.
-// - dispatch: /audio/ta/announcement-{N}.mp3
-// - entry:    /audio/ta/entry/counter-{C}-token-{N}.mp3
-// - payment:  /audio/ta/payment/token-{N}.mp3
+// - dispatch: Token எண் {N}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்
+// - entry:    Token எண் {N}, பதிவு கவுண்டர் {C}-க்கு வரவும்
+// - payment:  Token எண் {N}, தயவுசெய்து பணம் செலுத்தும் கவுண்டருக்கு வரவும்
 type QueueItem = {
   type: "dispatch" | "entry" | "payment"
   counterNumber?: number // only for entry
@@ -61,6 +57,7 @@ export function DisplayBoard() {
   const [lang, setLang] = useState<Lang>("en")
   const [now, setNow] = useState<Date | null>(null)
   const [soundOn, setSoundOn] = useState(false)
+  const [ttsAvailable, setTtsAvailable] = useState<boolean | null>(null)
 
   // Dispatch: keyed off called_at (changes on every call AND recall)
   const lastDispatchCallRef = useRef<string | null>(null)
@@ -73,15 +70,13 @@ export function DisplayBoard() {
   // Entry: recall trigger (one ref per counter — keyed off recalled_at)
   const lastEntryRecallRefs = useRef<Record<number, string | null>>({})
 
-  // Payment: number-change trigger (mirrors entry pattern)
+  // Payment: number-change trigger
   const lastPaymentNumberRef = useRef<number | null>(null)
   const paymentInitializedRef = useRef(false)
 
   // Payment: recall trigger (keyed off recalled_at)
   const lastPaymentRecallRef = useRef<string | null>(null)
 
-  const audioCtxRef = useRef<AudioContext | null>(null)
-  const sharedAudioRef = useRef<HTMLAudioElement | null>(null)
   const audioQueueRef = useRef<QueueItem[]>([])
   const isPlayingRef = useRef(false)
 
@@ -121,36 +116,86 @@ export function DisplayBoard() {
     return () => clearInterval(id)
   }, [])
 
-  // Lazily create or return the single AudioContext shared by the chime and
-  // announcement playback.
-  const getAudioContext = useCallback(() => {
-    if (audioCtxRef.current) {
-      console.log("[audio] getAudioContext: reusing existing ctx, state =", audioCtxRef.current.state)
-      return audioCtxRef.current
+  // Feature-detect Tamil TTS on mount. SpeechSynthesis voices load
+  // asynchronously; we check both on mount and after voiceschanged fires.
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      setTtsAvailable(false)
+      return
     }
+
+    const checkVoices = () => {
+      const voices = speechSynthesis.getVoices()
+      console.log("[tts] available voices:", voices.map((v) => `${v.name} (${v.lang})`))
+      const hasTamil = voices.some((v) => v.lang.startsWith("ta"))
+      console.log("[tts] Tamil voice available:", hasTamil)
+      setTtsAvailable(hasTamil)
+    }
+
+    // Check immediately
+    checkVoices()
+
+    // Some browsers fire voiceschanged after the list populates
+    speechSynthesis.addEventListener("voiceschanged", checkVoices)
+    return () => speechSynthesis.removeEventListener("voiceschanged", checkVoices)
+  }, [])
+
+  // Speak an announcement using speechSynthesis, returning a Promise that
+  // resolves when playback finishes (or errors). Never rejects — errors just
+  // resolve so the queue continues.
+  const speakAnnouncement = useCallback((text: string): Promise<void> => {
+    return new Promise<void>((resolve) => {
+      if (!("speechSynthesis" in window)) {
+        console.error("[tts] speechSynthesis not available")
+        resolve()
+        return
+      }
+
+      console.log("[tts] speaking:", text)
+      const utterance = new SpeechSynthesisUtterance(text)
+      const voices = speechSynthesis.getVoices()
+      const tamilVoice = voices.find((v) => v.lang.startsWith("ta"))
+      if (tamilVoice) {
+        console.log("[tts] using voice:", tamilVoice.name, tamilVoice.lang)
+        utterance.voice = tamilVoice
+      } else {
+        console.warn("[tts] no Tamil voice found, using default")
+      }
+      utterance.lang = "ta-IN"
+      utterance.rate = 0.85
+
+      utterance.onend = () => {
+        console.log("[tts] utterance ended")
+        resolve()
+      }
+      utterance.onerror = (e) => {
+        console.error("[tts] utterance error:", e)
+        resolve() // never stall the queue on failure
+      }
+
+      speechSynthesis.speak(utterance)
+    })
+  }, [])
+
+  // Play a two-note chime using Web Audio API (pure tones, no media element).
+  const playChime = useCallback(() => {
+    if (typeof window === "undefined") return
+
     const WebkitAudioWindow = window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
     const Ctx = window.AudioContext || WebkitAudioWindow.webkitAudioContext
     if (!Ctx) {
-      console.error("[audio] getAudioContext: no AudioContext or webkitAudioContext available")
-      return null
-    }
-    try {
-      audioCtxRef.current = new Ctx()
-      console.log("[audio] getAudioContext: created NEW ctx, state =", audioCtxRef.current.state)
-    } catch (err) {
-      console.error("[audio] getAudioContext: failed to create ctx:", err)
-      audioCtxRef.current = null
-    }
-    return audioCtxRef.current
-  }, [])
-
-  // Play a two-note chime on the shared AudioContext.
-  const playChime = useCallback(() => {
-    const ctx = getAudioContext()
-    if (!ctx) {
-      console.warn("[audio] playChime: no AudioContext, aborting")
+      console.warn("[audio] no AudioContext available")
       return
     }
+
+    let ctx: AudioContext
+    try {
+      ctx = new Ctx()
+    } catch (err) {
+      console.error("[audio] failed to create AudioContext:", err)
+      return
+    }
+
     console.log("[audio] playChime: ctx.state =", ctx.state, "ctx.currentTime =", ctx.currentTime)
     const notes = [880, 1174]
     notes.forEach((freq, i) => {
@@ -164,64 +209,50 @@ export function DisplayBoard() {
       gain.gain.setValueAtTime(0.0001, start)
       gain.gain.exponentialRampToValueAtTime(0.3, start + 0.02)
       gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35)
-      console.log("[audio] playChime: scheduling note", i, "freq =", freq, "start =", start)
       osc.start(start)
       osc.stop(start + 0.36)
     })
-  }, [getAudioContext])
+  }, [])
 
   // Global FIFO audio queue. Every announcement — Dispatch, Entry, AND Payment —
   // is pushed here and played strictly one-at-a-time (chime + speech as one unit).
   const processQueueRef = useRef<() => void>(() => {})
   const processQueue = useCallback(() => {
-    const audio = sharedAudioRef.current
     if (isPlayingRef.current) return
-    if (!audio) {
-      console.error("[audio] processQueue: no shared audio element mounted")
-      return
-    }
     const next = audioQueueRef.current.shift()
     if (!next) return
 
     isPlayingRef.current = true
     console.log("[audio] processQueue: playing", next, "queue =", audioQueueRef.current.length)
 
-    void playChime()
+    // Build the Tamil announcement text per counter type
+    let text = ""
+    if (next.type === "dispatch") {
+      text = `Token எண் ${next.tokenNumber}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்`
+    } else if (next.type === "entry") {
+      text = `Token எண் ${next.tokenNumber}, பதிவு கவுண்டர் ${next.counterNumber}-க்கு வரவும்`
+    } else if (next.type === "payment") {
+      text = `Token எண் ${next.tokenNumber}, தயவுசெய்து பணம் செலுத்தும் கவுண்டருக்கு வரவும்`
+    }
+
+    console.log("[audio] announcement text:", text)
+
+    // Chime first
+    playChime()
+
+    // Then speak after 450ms delay (matches the old MP3 timing)
     setTimeout(() => {
-      // Resolve the pre-generated MP3 path for each station type.
-      const path =
-        next.type === "dispatch"
-          ? `/audio/ta/announcement-${next.tokenNumber}.mp3`
-          : next.type === "payment"
-            ? `/audio/ta/payment/token-${next.tokenNumber}.mp3`
-            : `/audio/ta/entry/counter-${next.counterNumber}-token-${next.tokenNumber}.mp3`
-      console.log("[audio] processQueue: item type =", next.type, "resolved path =", path)
-
-      // Belt-and-suspenders: if the shared element somehow ended up mid-play,
-      // defer rather than reassigning .src under a pending play() — that is
-      // what causes AbortError on TV WebKit.
-      if (!audio.paused) {
-        console.log("[audio] processQueue: shared element busy, deferring", next)
-        audioQueueRef.current.unshift(next)
-        isPlayingRef.current = false
-        setTimeout(() => processQueueRef.current(), 300)
-        return
-      }
-
-      audio.setAttribute("src", path)
-      audio.load()
-      audio.play().catch((err) => {
-        console.error("[audio] queue playback failed:", err)
-        isPlayingRef.current = false
-        processQueueRef.current()
-      })
-
-      audio.onended = () => {
-        isPlayingRef.current = false
-        processQueueRef.current()
-      }
+      speakAnnouncement(text)
+        .then(() => {
+          isPlayingRef.current = false
+          processQueueRef.current() // process next item
+        })
+        .catch(() => {
+          isPlayingRef.current = false
+          processQueueRef.current()
+        })
     }, 450)
-  }, [playChime])
+  }, [playChime, speakAnnouncement])
 
   // Keep the latest processQueue closure accessible to its own async handlers.
   useEffect(() => {
@@ -267,36 +298,20 @@ export function DisplayBoard() {
   // ─── ENTRY NUMBER-CHANGE WATCHER ─────────────────────────────────────────
   // Watch each entry counter; announce whenever its token_number changes to a
   // NEW value. This is the primary trigger (new call / held-token recall).
-  // Does NOT update lastEntryRecallRefs — that ref is only touched by the
-  // recall watcher below, so the two triggers stay independent.
   useEffect(() => {
     const entryRows = rows.filter((r) => r.station === "entry" && r.counter != null)
-    console.log("[entry-watch] rows for entry stations:", entryRows)
     for (const row of entryRows) {
       const counter = Number(row.counter!)
       const current = row.token_number
 
-      console.log(
-        `[entry-watch] counter ${counter}: current=${current}, lastAnnounced=${lastEntryNumberRefs.current[counter]}`,
-      )
-
       if (!entryInitializedRef.current.has(counter)) {
         lastEntryNumberRefs.current[counter] = current
         entryInitializedRef.current.add(counter)
-        console.log(`[entry-watch] counter ${counter}: initialized, baseline=${current}`)
         continue
       }
 
       if (current !== null && current !== lastEntryNumberRefs.current[counter]) {
-        // Synchronous ref update before enqueue — closes the realtime-vs-polling
-        // duplicate-trigger race.
         lastEntryNumberRefs.current[counter] = current
-        console.log(
-          `[entry-watch] enqueueing:`,
-          { type: "entry", counterNumber: counter, tokenNumber: current },
-          "soundOn =",
-          soundOn,
-        )
         if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current })
       }
     }
@@ -304,9 +319,7 @@ export function DisplayBoard() {
 
   // ─── ENTRY RECALL WATCHER ────────────────────────────────────────────────
   // Watch each entry counter's recalled_at; re-announce the SAME token when
-  // the staff presses "Call Again". Keys off recalled_at (not token_number),
-  // so it fires even though the number hasn't changed. Does NOT touch
-  // lastEntryNumberRefs, keeping the two triggers completely independent.
+  // the staff presses "Call Again".
   useEffect(() => {
     const entryRows = rows.filter((r) => r.station === "entry" && r.counter != null)
     for (const row of entryRows) {
@@ -314,11 +327,8 @@ export function DisplayBoard() {
       const current = row.token_number
       const recalledAt = row.recalled_at ?? null
 
-      // Skip counters we haven't initialized yet (the number-change watcher
-      // handles first-sight initialization).
       if (!entryInitializedRef.current.has(counter)) continue
 
-      // Initialize the recall ref on first sight of this counter's recalled_at.
       if (!(counter in lastEntryRecallRefs.current)) {
         lastEntryRecallRefs.current[counter] = recalledAt
         continue
@@ -329,14 +339,7 @@ export function DisplayBoard() {
         recalledAt !== null &&
         recalledAt !== lastEntryRecallRefs.current[counter]
       ) {
-        // Synchronous update before enqueue (same race-condition fix as the
-        // number-change watcher).
         lastEntryRecallRefs.current[counter] = recalledAt
-        console.log(
-          `[entry-recall] counter ${counter}: re-announcing token ${current} (recalled_at=${recalledAt})`,
-        )
-        // Recall does NOT update lastEntryNumberRefs — the number hasn't
-        // changed, so the number-change watcher should remain unaffected.
         if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current })
       }
     }
@@ -356,24 +359,21 @@ export function DisplayBoard() {
     }
 
     if (current !== null && current !== lastPaymentNumberRef.current) {
-      // Synchronous update before enqueue.
       lastPaymentNumberRef.current = current
-      console.log(`[payment-watch] new token ${current}, enqueueing`)
       if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current })
     }
   }, [rows, soundOn, enqueueAnnouncement])
 
   // ─── PAYMENT RECALL WATCHER ──────────────────────────────────────────────
   // Watch the payment counter's recalled_at; re-announce the SAME token when
-  // the staff presses "Call Again". Mirrors the Entry recall pattern exactly.
+  // the staff presses "Call Again".
   useEffect(() => {
     const payment = rows.find((r) => r.station === "payment")
     const current = payment?.token_number ?? null
     const recalledAt = payment?.recalled_at ?? null
 
-    if (!paymentInitializedRef.current) return // wait for number-change init first
+    if (!paymentInitializedRef.current) return
 
-    // Initialize the recall ref on first sight.
     if (lastPaymentRecallRef.current === null && recalledAt === null) {
       lastPaymentRecallRef.current = recalledAt
       return
@@ -388,47 +388,16 @@ export function DisplayBoard() {
       recalledAt !== null &&
       recalledAt !== lastPaymentRecallRef.current
     ) {
-      // Synchronous update before enqueue.
       lastPaymentRecallRef.current = recalledAt
-      console.log(
-        `[payment-recall] re-announcing token ${current} (recalled_at=${recalledAt})`,
-      )
       if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current })
     }
   }, [rows, soundOn, enqueueAnnouncement])
 
   const enableSound = () => {
     console.log("[audio] enableSound: user gesture fired")
-    const ctx = getAudioContext()
-    if (ctx) {
-      console.log("[audio] enableSound: ctx.state BEFORE resume =", ctx.state)
-      try {
-        const p = ctx.resume()
-        console.log("[audio] enableSound: ctx.resume() returned promise")
-        p.then(
-          () => console.log("[audio] enableSound: ctx.resume() RESOLVED, state =", ctx.state),
-          (err) => console.error("[audio] enableSound: ctx.resume() REJECTED:", err),
-        )
-      } catch (err) {
-        console.error("[audio] enableSound: resume threw:", err)
-      }
-    } else {
-      console.warn("[audio] enableSound: no AudioContext available")
-    }
-    playChime()
-
-    const mediaElement = sharedAudioRef.current
-    if (mediaElement) {
-      void unlockAndPlay({
-        audioElement: mediaElement,
-        audioContext: ctx,
-        sourceUrl: `/audio/ta/announcement-5.mp3`,
-      })
-    } else {
-      console.warn("[audio] enableSound: no shared audio element mounted yet to unlock")
-    }
-
     setSoundOn(true)
+    // Play a test chime to confirm audio works
+    playChime()
   }
 
   const timeText = now
@@ -458,27 +427,6 @@ export function DisplayBoard() {
 
   return (
     <main className="flex min-h-screen flex-col bg-white text-black">
-      {/* Hidden announcement player. Follows TV-browser media best practices:
-          playsinline + preload=auto + crossorigin + a fallback <source> list
-          (MP3 prioritized over WAV). It is intentionally NOT autoplaying — all
-          audio starts from an explicit user interaction (see enableSound).
-          ONE shared element serves the entire global queue: since only one
-          announcement plays at a time (chime + speech), no per-counter
-          elements are needed. */}
-      <audio
-        ref={sharedAudioRef}
-        preload="auto"
-        playsInline
-        crossOrigin="anonymous"
-        className="hidden"
-      >
-        {/* Static fallback sources. MP3 prioritized; processQueue overrides the
-            active source at play time, so these only matter for the initial
-            decode/hardware-channel bind on TVs that preload. */}
-        <source src="/audio/ta/announcement-5.mp3" type="audio/mpeg" />
-        <source src="/audio/ta/announcement-50.mp3" type="audio/mpeg" />
-      </audio>
-
       {/* Header */}
       <header className="flex items-center justify-between gap-4 border-b-2 border-black/10 px-8 py-4">
         <div className="flex items-center gap-4">
@@ -507,6 +455,17 @@ export function DisplayBoard() {
           </div>
         </div>
       </header>
+
+      {/* TTS availability warning — persistent, visible if no Tamil voice detected */}
+      {ttsAvailable === false && (
+        <div className="flex items-center gap-3 border-b-2 border-amber-200 bg-amber-50 px-8 py-3">
+          <AlertTriangle className="h-5 w-5 flex-shrink-0 text-amber-600" aria-hidden="true" />
+          <p className="text-sm font-medium text-amber-900">
+            Tamil voice announcements unavailable on this device. Please check browser TTS settings or use a device with
+            Tamil language support installed.
+          </p>
+        </div>
+      )}
 
       {/* Five-counter grid */}
       <section className="grid flex-1 grid-cols-2 gap-4 border-t-2 border-black/10 p-6 lg:grid-cols-5">

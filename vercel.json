@@ -4,16 +4,5 @@
       "path": "/api/cron/daily-reset",
       "schedule": "10 18 * * *"
     }
-  ],
-  "headers": [
-    {
-      "source": "/audio/ta/(.*).mp3",
-      "headers": [
-        { "key": "Content-Type", "value": "audio/mpeg" },
-        { "key": "Accept-Ranges", "value": "bytes" },
-        { "key": "Access-Control-Allow-Origin", "value": "*" },
-        { "key": "Cache-Control", "value": "public, no-cache, must-revalidate" }
-      ]
-    }
   ]
 }
