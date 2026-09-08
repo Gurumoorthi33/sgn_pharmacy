@@ -14,6 +14,14 @@ type DisplayRow = {
   called_at: string | null
 }
 
+// One unit of work for the global FIFO audio queue. Dispatch announcements
+// carry no counter; Entry announcements carry the counter they came from.
+type QueueItem = {
+  type: "dispatch" | "entry"
+  counterNumber?: number
+  tokenNumber: number
+}
+
 const STRINGS = {
   en: {
     hospital: HOSPITAL_NAME,
@@ -52,8 +60,9 @@ export function DisplayBoard() {
   const entryInitializedRef = useRef<Set<number>>(new Set())
   const initializedRef = useRef(false)
   const audioCtxRef = useRef<AudioContext | null>(null)
-  const announceAudioRef = useRef<HTMLAudioElement | null>(null)
-  const entryAudioRefs = useRef<Record<number, HTMLAudioElement | null>>({})
+  const sharedAudioRef = useRef<HTMLAudioElement | null>(null)
+  const audioQueueRef = useRef<QueueItem[]>([])
+  const isPlayingRef = useRef(false)
 
   // Load + subscribe to the live board
   useEffect(() => {
@@ -144,73 +153,88 @@ export function DisplayBoard() {
     })
   }, [getAudioContext])
 
-  // Announce a dispatched token by playing the single pre-rendered Tamil
-  // announcement for that token number via a plain <audio> element. The Web
-  // Audio decode path (decodeAudioData) is less reliably supported on embedded
-  // Chromium builds (Silk on Fire TV) than the standard HTML5 <audio> tag,
-  // which Amazon documents as fully supporting MP3/OGG/WAV.
+  // Global FIFO audio queue. Every announcement — Dispatch AND all Entry
+  // Counters — is pushed here and played strictly one-at-a-time (chime +
+  // speech as one unit). Only one clip plays at any moment system-wide; the
+  // rest wait their turn, so near-simultaneous calls across counters never
+  // overlap or talk over each other.
   //
-  // Belt-and-suspenders guard: the trigger (realtime + polling) can fire this
-  // twice for a single dispatch call. Reusing one persistent <audio> element
-  // whose .src is reassigned while the prior .play() promise is still pending
-  // throws an AbortError, so we skip playback if the same element is already
-  // playing. We also call .load() before .play() on old TV engines to bind the
-  // decoded stream to a hardware channel.
-  const announceDispatch = useCallback(
-    (tokenNumber: number) => {
-      void playChime()
-      setTimeout(() => {
-        const audio = announceAudioRef.current
-        if (audio && !audio.paused) {
-          console.log("[audio] duplicate announceDispatch call ignored for token", tokenNumber)
-          return
-        }
-        if (!audio) {
-          console.error("[audio] announceDispatch: no audio element mounted")
-          return
-        }
-        const path = `/audio/ta/announcement-${tokenNumber}.mp3`
-        audio.setAttribute("src", path)
-        audio.load()
-        audio.play().catch((err) => console.error("[audio] announcement playback failed:", err))
-      }, 450)
-    },
-    [playChime],
-  )
+  // processQueue re-invokes itself from async handlers (onended, catch,
+  // deferral timer); those calls go through processQueueRef so we never
+  // reference the callback before its declaration (avoids TDZ/immutability
+  // lint errors and always calls the latest closure).
+  const processQueueRef = useRef<() => void>(() => {})
+  const processQueue = useCallback(() => {
+    const audio = sharedAudioRef.current
+    if (isPlayingRef.current) return // something's playing — pickup on onended
+    if (!audio) {
+      console.error("[audio] processQueue: no shared audio element mounted")
+      return
+    }
+    const next = audioQueueRef.current.shift()
+    if (!next) return // queue empty
 
-  // Announce an entry-counter call by playing the single pre-rendered Tamil
-  // announcement for that (counter, token) via a per-counter <audio> element.
-  // Counter calls can overlap in time (unlike the single dispatch counter), so
-  // each counter has its own primed element — sharing one element across
-  // counters would abort the first announcement when a second counter calls
-  // near-simultaneously. Same pattern as announceDispatch: chime first, then
-  // after 450ms set src → load() → play() on the reused element, guarded by
-  // !paused to prevent the AbortError race.
-  const announceEntry = useCallback(
-    (counterNumber: number, tokenNumber: number) => {
-      void playChime()
-      setTimeout(() => {
-        const audio = entryAudioRefs.current[counterNumber]
-        if (audio && !audio.paused) {
-          console.log(
-            "[audio] duplicate announceEntry call ignored for counter",
-            counterNumber,
-            "token",
-            tokenNumber,
-          )
-          return
-        }
-        if (!audio) {
-          console.error("[audio] announceEntry: no audio element mounted for counter", counterNumber)
-          return
-        }
-        const path = `/audio/ta/entry/counter-${counterNumber}-token-${tokenNumber}.mp3`
-        audio.setAttribute("src", path)
-        audio.load()
-        audio.play().catch((err) => console.error("[audio] entry announcement playback failed:", err))
-      }, 450)
+    isPlayingRef.current = true
+    console.log("[audio] processQueue: playing", next, "queue =", audioQueueRef.current.length)
+
+    void playChime()
+    setTimeout(() => {
+      const path =
+        next.type === "dispatch"
+          ? `/audio/ta/announcement-${next.tokenNumber}.mp3`
+          : `/audio/ta/entry/counter-${next.counterNumber}-token-${next.tokenNumber}.mp3`
+
+      // Belt-and-suspenders: if the shared element somehow ended up mid-play
+      // (e.g. the 450ms window overlapped another sheet), skip this one rather
+      // than reassigning .src under a pending play() — reassignment is what
+      // causes the AbortError on TV WebKit. This is a safety net; the queue
+      // itself should already guarantee only one active .play() at a time.
+      if (!audio.paused) {
+        console.log("[audio] processQueue: shared element busy, deferring", next)
+        audioQueueRef.current.unshift(next)
+        isPlayingRef.current = false
+        setTimeout(() => processQueueRef.current(), 300)
+        return
+      }
+
+      audio.setAttribute("src", path)
+      audio.load()
+      audio.play().catch((err) => {
+        console.error("[audio] queue playback failed:", err)
+        isPlayingRef.current = false
+        processQueueRef.current()
+      })
+
+      audio.onended = () => {
+        isPlayingRef.current = false
+        processQueueRef.current() // immediately check for and play the next queued item
+      }
+    }, 450)
+  }, [playChime])
+
+  // Keep the latest processQueue closure accessible to its own async handlers.
+  // Must be in an effect (refs cannot be updated during render). All re-invocations
+  // of processQueue happen asynchronously (onended / catch / deferral timer), so by
+  // the time any of them runs, this effect has already run.
+  useEffect(() => {
+    processQueueRef.current = processQueue
+  }, [processQueue])
+
+  // Push an announcement onto the global queue and kick the sequential player.
+  // Includes a queue-size safety cap: if the pending queue exceeds the cap,
+  // drop the oldest excess entry (rather than letting stale announcements pile
+  // up and play minutes late) and log a warning.
+  const enqueueAnnouncement = useCallback(
+    (item: QueueItem) => {
+      const MAX_PENDING = 12
+      while (audioQueueRef.current.length >= MAX_PENDING) {
+        const dropped = audioQueueRef.current.shift()
+        console.warn("[audio] queue overflow: dropping oldest announcement", dropped)
+      }
+      audioQueueRef.current.push(item)
+      processQueue()
     },
-    [playChime],
+    [processQueue],
   )
 
   // Watch the dispatch counter; announce whenever it is called — a NEW token
@@ -229,13 +253,13 @@ export function DisplayBoard() {
     }
 
     if (current !== null && calledAt !== null && calledAt !== lastDispatchCallRef.current) {
-      // Update the ref synchronously, BEFORE calling announceDispatch, so that
-      // if the polling check runs a few ms later (before announceDispatch
-      // finishes) it already sees the updated value and skips the second call.
+      // Update the ref synchronously, BEFORE enqueueing, so that if the polling
+      // check runs a few ms later (before the queue processes it) it already
+      // sees the updated value and skips the second trigger.
       lastDispatchCallRef.current = calledAt
-      if (soundOn) void announceDispatch(current)
+      if (soundOn) enqueueAnnouncement({ type: "dispatch", tokenNumber: current })
     }
-  }, [rows, soundOn, announceDispatch])
+  }, [rows, soundOn, enqueueAnnouncement])
 
   // Watch the entry counters; announce whenever any one of them shows a NEW
   // "now serving" token number. Entry Counters have NO recall/"Call Again"
@@ -263,13 +287,13 @@ export function DisplayBoard() {
       }
 
       if (current !== null && current !== lastEntryNumberRefs.current[counter]) {
-        // Update the ref synchronously BEFORE calling announceEntry so a
-        // polling check a few ms later sees the new value and skips.
+        // Update the ref synchronously BEFORE enqueueing so a polling check a
+        // few ms later sees the new value and skips.
         lastEntryNumberRefs.current[counter] = current
-        if (soundOn) void announceEntry(counter, current)
+        if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current })
       }
     }
-  }, [rows, soundOn, announceEntry])
+  }, [rows, soundOn, enqueueAnnouncement])
 
   const enableSound = () => {
     console.log("[audio] enableSound: user gesture fired")
@@ -297,12 +321,13 @@ export function DisplayBoard() {
     // Chime first — proves the context unlocked on-device.
     playChime()
 
-    // Prime the HTMLMediaElement onto a hardware channel and prove playback
+    // Prime the shared HTMLMediaElement onto a hardware channel and prove playback
     // starts within the gesture. We keep the synchronous AudioContext resume
     // above intact (some engines invalidate the trusted gesture on the first
     // await), then run the media unlock after — calling load() before play()
-    // so older TV WebKit engines bind the stream to a hardware channel.
-    const mediaElement = announceAudioRef.current
+    // so older TV WebKit engines bind the stream to a hardware channel. One
+    // shared element now serves the whole queue.
+    const mediaElement = sharedAudioRef.current
     if (mediaElement) {
       void unlockAndPlay({
         audioElement: mediaElement,
@@ -310,21 +335,7 @@ export function DisplayBoard() {
         sourceUrl: `/audio/ta/announcement-5.mp3`,
       })
     } else {
-      console.warn("[audio] enableSound: no dispatch audio element mounted yet to unlock")
-    }
-
-    // Prime each entry-counter audio element onto its own hardware channel,
-    // exactly like the dispatch element above, so near-simultaneous calls
-    // across counters each play on an already-primed channel.
-    for (const counter of [1, 2, 3]) {
-      const entryMedia = entryAudioRefs.current[counter]
-      if (entryMedia) {
-        void unlockAndPlay({
-          audioElement: entryMedia,
-          audioContext: ctx,
-          sourceUrl: `/audio/ta/entry/counter-${counter}-token-1.mp3`,
-        })
-      }
+      console.warn("[audio] enableSound: no shared audio element mounted yet to unlock")
     }
 
     // setSoundOn AFTER oscillators are scheduled — React state dispatch
@@ -364,40 +375,23 @@ export function DisplayBoard() {
       {/* Hidden announcement player. Follows TV-browser media best practices:
           playsinline + preload=auto + crossorigin + a fallback <source> list
           (MP3 prioritized over WAV). It is intentionally NOT autoplaying — all
-          audio starts from an explicit user interaction (see enableSound). */}
+          audio starts from an explicit user interaction (see enableSound).
+          ONE shared element serves the entire global queue: since only one
+          announcement plays at a time (chime + speech), no per-counter
+          elements are needed. */}
       <audio
-        ref={announceAudioRef}
+        ref={sharedAudioRef}
         preload="auto"
         playsInline
         crossOrigin="anonymous"
         className="hidden"
       >
-        {/* Static fallback sources. MP3 prioritized; announceDispatch overrides
-            the active source at play time, so these only matter for the initial
+        {/* Static fallback sources. MP3 prioritized; processQueue overrides the
+            active source at play time, so these only matter for the initial
             decode/hardware-channel bind on TVs that preload. */}
         <source src="/audio/ta/announcement-5.mp3" type="audio/mpeg" />
         <source src="/audio/ta/announcement-50.mp3" type="audio/mpeg" />
       </audio>
-
-      {/* Per-counter entry announcement players. One primed <audio> element per
-          entry counter so calls at different counters can play near-simultaneously
-          without one aborting another on the shared element. Same TV-browser
-          media attributes as the dispatch player. */}
-      {[1, 2, 3].map((counter) => (
-        <audio
-          key={counter}
-          ref={(el) => {
-            entryAudioRefs.current[counter] = el
-          }}
-          preload="auto"
-          playsInline
-          crossOrigin="anonymous"
-          className="hidden"
-        >
-          <source src={`/audio/ta/entry/counter-${counter}-token-1.mp3`} type="audio/mpeg" />
-          <source src={`/audio/ta/entry/counter-${counter}-token-2.mp3`} type="audio/mpeg" />
-        </audio>
-      ))}
 
       {/* Header */}
       <header className="flex items-center justify-between gap-4 border-b-2 border-black/10 px-8 py-4">
