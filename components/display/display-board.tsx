@@ -49,7 +49,6 @@ export function DisplayBoard() {
   const lastDispatchCallRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
   const audioCtxRef = useRef<AudioContext | null>(null)
-  const audioBuffersRef = useRef<Map<string, AudioBuffer>>(new Map())
 
   // Load + subscribe to the live board
   useEffect(() => {
@@ -140,51 +139,20 @@ export function DisplayBoard() {
     })
   }, [getAudioContext])
 
-  // Lazily fetch + decode a single pre-rendered announcement WAV into an
-  // AudioBuffer, caching it so recalled tokens replay instantly without
-  // refetching. One file per token number — no multi-clip chaining.
-  const getAnnouncementBuffer = useCallback(
-    async (tokenNumber: number) => {
-      const ctx = getAudioContext()
-      if (!ctx) return null
-      const path = `/audio/ta/announcement-${tokenNumber}.wav`
-      const cached = audioBuffersRef.current.get(path)
-      if (cached) return cached
-      try {
-        const arrayBuffer = await fetch(path).then((r) => r.arrayBuffer())
-        const decoded = await ctx.decodeAudioData(arrayBuffer)
-        audioBuffersRef.current.set(path, decoded)
-        console.log(`[audio] decoded OK: ${path}, duration=${decoded.duration}`)
-        return decoded
-      } catch (err) {
-        console.error(`[audio] DECODE FAILED for ${path}:`, err)
-        return null
-      }
-    },
-    [getAudioContext],
-  )
-
   // Announce a dispatched token by playing the single pre-rendered Tamil
-  // announcement for that token number — one file, one AudioBufferSourceNode,
-  // no onended-chained sequence.
+  // announcement for that token number via a plain <audio> element. The Web
+  // Audio decode path (decodeAudioData) is less reliably supported on embedded
+  // Chromium builds (Silk on Fire TV) than the standard HTML5 <audio> tag,
+  // which Amazon documents as fully supporting MP3/OGG/WAV.
   const announceDispatch = useCallback(
-    async (tokenNumber: number) => {
-      const ctx = getAudioContext()
-      if (!ctx) return
-
+    (tokenNumber: number) => {
       void playChime()
-
-      const buffer = await getAnnouncementBuffer(tokenNumber)
-      if (!buffer) {
-        console.warn(`[audio] announceDispatch: buffer not ready for token ${tokenNumber}, chime only`)
-        return
-      }
-      const source = ctx.createBufferSource()
-      source.buffer = buffer
-      source.connect(ctx.destination)
-      source.start()
+      setTimeout(() => {
+        const audio = new Audio(`/audio/ta/announcement-${tokenNumber}.wav`)
+        audio.play().catch((err) => console.error("[audio] announcement playback failed:", err))
+      }, 450)
     },
-    [playChime, getAudioContext, getAnnouncementBuffer],
+    [playChime],
   )
 
   // Watch the dispatch counter; announce whenever it is called — a NEW token

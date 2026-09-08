@@ -4,5 +4,14 @@
       "path": "/api/cron/daily-reset",
       "schedule": "10 18 * * *"
     }
+  ],
+  "headers": [
+    {
+      "source": "/audio/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" },
+        { "key": "Access-Control-Allow-Origin", "value": "*" }
+      ]
+    }
   ]
 }
