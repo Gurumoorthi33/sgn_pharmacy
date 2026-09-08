@@ -4,6 +4,7 @@ import Image from "next/image"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createClient } from "@/lib/supabase/client"
 import { HOSPITAL_NAME, SYSTEM_NAME } from "@/lib/types"
+import { unlockAndPlay } from "@/lib/audio-unlock"
 import { Volume2 } from "lucide-react"
 
 type DisplayRow = {
@@ -147,19 +148,27 @@ export function DisplayBoard() {
   // which Amazon documents as fully supporting MP3/OGG/WAV.
   //
   // Belt-and-suspenders guard: the trigger (realtime + polling) can fire this
-  // twice for a single dispatch call. A shared Audio element whose .src is
-  // reassigned while the prior .play() promise is still pending throws an
-  // AbortError, so we skip playback if the same element is already playing.
+  // twice for a single dispatch call. Reusing one persistent <audio> element
+  // whose .src is reassigned while the prior .play() promise is still pending
+  // throws an AbortError, so we skip playback if the same element is already
+  // playing. We also call .load() before .play() on old TV engines to bind the
+  // decoded stream to a hardware channel.
   const announceDispatch = useCallback(
     (tokenNumber: number) => {
       void playChime()
       setTimeout(() => {
-        if (announceAudioRef.current && !announceAudioRef.current.paused) {
+        const audio = announceAudioRef.current
+        if (audio && !audio.paused) {
           console.log("[audio] duplicate announceDispatch call ignored for token", tokenNumber)
           return
         }
-        const audio = new Audio(`/audio/ta/announcement-${tokenNumber}.mp3`)
-        announceAudioRef.current = audio
+        if (!audio) {
+          console.error("[audio] announceDispatch: no audio element mounted")
+          return
+        }
+        const path = `/audio/ta/announcement-${tokenNumber}.mp3`
+        audio.setAttribute("src", path)
+        audio.load()
         audio.play().catch((err) => console.error("[audio] announcement playback failed:", err))
       }, 450)
     },
@@ -215,6 +224,23 @@ export function DisplayBoard() {
     }
     // Chime first — proves the context unlocked on-device.
     playChime()
+
+    // Prime the HTMLMediaElement onto a hardware channel and prove playback
+    // starts within the gesture. We keep the synchronous AudioContext resume
+    // above intact (some engines invalidate the trusted gesture on the first
+    // await), then run the media unlock after — calling load() before play()
+    // so older TV WebKit engines bind the stream to a hardware channel.
+    const mediaElement = announceAudioRef.current
+    if (mediaElement) {
+      void unlockAndPlay({
+        audioElement: mediaElement,
+        audioContext: ctx,
+        sourceUrl: `/audio/ta/announcement-5.mp3`,
+      })
+    } else {
+      console.warn("[audio] enableSound: no audio element mounted yet to unlock")
+    }
+
     // setSoundOn AFTER oscillators are scheduled — React state dispatch
     // schedules a render that runs on the microtask queue; on Silk this can
     // interrupt the synchronous gesture processing. Doing it last preserves
@@ -249,6 +275,24 @@ export function DisplayBoard() {
 
   return (
     <main className="flex min-h-screen flex-col bg-white text-black">
+      {/* Hidden announcement player. Follows TV-browser media best practices:
+          playsinline + preload=auto + crossorigin + a fallback <source> list
+          (MP3 prioritized over WAV). It is intentionally NOT autoplaying — all
+          audio starts from an explicit user interaction (see enableSound). */}
+      <audio
+        ref={announceAudioRef}
+        preload="auto"
+        playsInline
+        crossOrigin="anonymous"
+        className="hidden"
+      >
+        {/* Static fallback sources. MP3 prioritized; announceDispatch overrides
+            the active source at play time, so these only matter for the initial
+            decode/hardware-channel bind on TVs that preload. */}
+        <source src="/audio/ta/announcement-5.mp3" type="audio/mpeg" />
+        <source src="/audio/ta/announcement-50.mp3" type="audio/mpeg" />
+      </audio>
+
       {/* Header */}
       <header className="flex items-center justify-between gap-4 border-b-2 border-black/10 px-8 py-4">
         <div className="flex items-center gap-4">
