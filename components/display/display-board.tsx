@@ -49,13 +49,6 @@ export function DisplayBoard() {
   const lastDispatchCallRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
   const audioCtxRef = useRef<AudioContext | null>(null)
-  const announcementAudioRef = useRef<HTMLAudioElement | null>(null)
-  const [audioError, setAudioError] = useState<string | null>(null)
-
-  // TEMP DEBUG FLAG: surface the caught audio error name/message on-screen so
-  // it's visible on the Fire Stick's Silk browser without dev tools. Remove
-  // alongside audioErrorState + the debug <div> once the real error is known.
-  const DEBUG_AUDIO_ERROR = true
 
   // Load + subscribe to the live board
   useEffect(() => {
@@ -147,29 +140,19 @@ export function DisplayBoard() {
   }, [getAudioContext])
 
   // Announce a dispatched token by playing the single pre-rendered Tamil
-  // announcement for that token number via a plain <audio> element. Reuse the
-  // element that was primed (already granted autoplay permission) inside the
-  // user-gesture handler — creating a fresh new Audio() here, outside the click
-  // gesture, can be silently denied autoplay on embedded Chromium builds.
+  // announcement for that token number via a plain <audio> element. The Web
+  // Audio decode path (decodeAudioData) is less reliably supported on embedded
+  // Chromium builds (Silk on Fire TV) than the standard HTML5 <audio> tag,
+  // which Amazon documents as fully supporting MP3/OGG/WAV.
   const announceDispatch = useCallback(
     (tokenNumber: number) => {
       void playChime()
       setTimeout(() => {
-        const audio = announcementAudioRef.current
-        if (!audio) {
-          setAudioError("[audio] no primed announcement element available")
-          return
-        }
-        audio.src = `/audio/ta/announcement-${tokenNumber}.wav`
-        audio.play().catch((err) => {
-          const name = err instanceof Error ? err.name : String(err)
-          const message = err instanceof Error ? err.message : String(err)
-          console.error("[audio] announcement playback failed:", err)
-          if (DEBUG_AUDIO_ERROR) setAudioError(`[${name}] ${message}`)
-        })
+        const audio = new Audio(`/audio/ta/announcement-${tokenNumber}.wav`)
+        audio.play().catch((err) => console.error("[audio] announcement playback failed:", err))
       }, 450)
     },
-    [playChime, DEBUG_AUDIO_ERROR],
+    [playChime],
   )
 
   // Watch the dispatch counter; announce whenever it is called — a NEW token
@@ -218,35 +201,6 @@ export function DisplayBoard() {
     }
     // Chime first — proves the context unlocked on-device.
     playChime()
-
-    // Prime the announcement <audio> element inside this user gesture. Creating
-    // and invoking .play() on it synchronously within the click handler grants
-    // it autoplay permission in Silk's eyes; reusing this same element later
-    // (in announceDispatch) lets the announcement play even though that call
-    // originates from a Supabase real-time event, not a user gesture.
-    try {
-      if (!announcementAudioRef.current) {
-        announcementAudioRef.current = new Audio()
-        announcementAudioRef.current.preload = "auto"
-      }
-      const primed = announcementAudioRef.current
-      const p = primed.play()
-      if (p !== undefined) {
-        p.then(() => {
-          // Near-instant pause: the point was just to satisfy autoplay policy.
-          try {
-            primed.pause()
-          } catch {
-            /* noop */
-          }
-        }).catch((err) => {
-          console.error("[audio] enableSound: priming play() rejected:", err)
-        })
-      }
-    } catch (err) {
-      console.error("[audio] enableSound: failed to create/prime announcement audio:", err)
-    }
-
     // setSoundOn AFTER oscillators are scheduled — React state dispatch
     // schedules a render that runs on the microtask queue; on Silk this can
     // interrupt the synchronous gesture processing. Doing it last preserves
@@ -318,13 +272,6 @@ export function DisplayBoard() {
         <CounterTile label={t.payment} value={paymentRow?.token_number ?? null} accent="black" empty={t.waiting} />
         <CounterTile label={t.dispatch} value={dispatchRow?.token_number ?? null} accent="green" empty={t.waiting} highlight />
       </section>
-
-      {DEBUG_AUDIO_ERROR && audioError ? (
-        <div className="fixed bottom-4 right-4 z-50 max-w-sm rounded-lg border-2 border-red-600 bg-red-50 p-4 text-sm font-mono text-red-800 shadow-lg">
-          <div className="mb-1 font-bold uppercase tracking-wide">Audio Error</div>
-          {audioError}
-        </div>
-      ) : null}
     </main>
   )
 }
