@@ -22,6 +22,7 @@ type QueueItem = {
   type: "dispatch" | "entry" | "payment"
   counterNumber?: number // only for entry
   tokenNumber: number
+  sourceKey: string // e.g. "dispatch", "entry-1", "entry-2", "entry-3", "payment"
 }
 
 const STRINGS = {
@@ -260,10 +261,22 @@ export function DisplayBoard() {
   }, [processQueue])
 
   // Push an announcement onto the global queue and kick the sequential player.
+  // Coalesces by sourceKey: rapid repeated triggers from the same counter
+  // replace any pending (not-yet-playing) item from that counter, keeping only
+  // the newest. Manual recalls (isManualRecall=true) bypass coalescing so every
+  // explicit button press always results in exactly one announcement.
   // Includes a queue-size safety cap: if the pending queue exceeds the cap,
   // drop the oldest excess entry and log a warning.
   const enqueueAnnouncement = useCallback(
-    (item: QueueItem) => {
+    (item: QueueItem, isManualRecall = false) => {
+      // Coalesce: remove any queued (not-yet-playing) item with the same sourceKey,
+      // unless this is a manual recall which must never be dropped.
+      if (!isManualRecall) {
+        audioQueueRef.current = audioQueueRef.current.filter(
+          (queued) => queued.sourceKey !== item.sourceKey,
+        )
+      }
+
       const MAX_PENDING = 12
       while (audioQueueRef.current.length >= MAX_PENDING) {
         const dropped = audioQueueRef.current.shift()
@@ -291,7 +304,10 @@ export function DisplayBoard() {
 
     if (current !== null && calledAt !== null && calledAt !== lastDispatchCallRef.current) {
       lastDispatchCallRef.current = calledAt
-      if (soundOn) enqueueAnnouncement({ type: "dispatch", tokenNumber: current })
+      // Dispatch announcements are always treated as manual recalls since the
+      // UI prevents rapid "Call" clicks (button is disabled while serving).
+      // "Call again" presses must never be coalesced away.
+      if (soundOn) enqueueAnnouncement({ type: "dispatch", tokenNumber: current, sourceKey: "dispatch" }, true)
     }
   }, [rows, soundOn, enqueueAnnouncement])
 
@@ -312,7 +328,7 @@ export function DisplayBoard() {
 
       if (current !== null && current !== lastEntryNumberRefs.current[counter]) {
         lastEntryNumberRefs.current[counter] = current
-        if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current })
+        if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current, sourceKey: `entry-${counter}` })
       }
     }
   }, [rows, soundOn, enqueueAnnouncement])
@@ -340,7 +356,8 @@ export function DisplayBoard() {
         recalledAt !== lastEntryRecallRefs.current[counter]
       ) {
         lastEntryRecallRefs.current[counter] = recalledAt
-        if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current })
+        // Manual recalls (Call Again) must never be coalesced away.
+        if (soundOn) enqueueAnnouncement({ type: "entry", counterNumber: counter, tokenNumber: current, sourceKey: `entry-${counter}` }, true)
       }
     }
   }, [rows, soundOn, enqueueAnnouncement])
@@ -360,7 +377,7 @@ export function DisplayBoard() {
 
     if (current !== null && current !== lastPaymentNumberRef.current) {
       lastPaymentNumberRef.current = current
-      if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current })
+      if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current, sourceKey: "payment" })
     }
   }, [rows, soundOn, enqueueAnnouncement])
 
@@ -389,7 +406,8 @@ export function DisplayBoard() {
       recalledAt !== lastPaymentRecallRef.current
     ) {
       lastPaymentRecallRef.current = recalledAt
-      if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current })
+      // Manual recalls (Call Again) must never be coalesced away.
+      if (soundOn) enqueueAnnouncement({ type: "payment", tokenNumber: current, sourceKey: "payment" }, true)
     }
   }, [rows, soundOn, enqueueAnnouncement])
 
