@@ -48,7 +48,7 @@ export function DisplayBoard() {
   const [now, setNow] = useState<Date | null>(null)
   const [soundOn, setSoundOn] = useState(false)
   const lastDispatchCallRef = useRef<string | null>(null)
-  const lastEntryCallRefs = useRef<Record<number, string | null>>({})
+  const lastEntryNumberRefs = useRef<Record<number, number | null>>({})
   const entryInitializedRef = useRef<Set<number>>(new Set())
   const initializedRef = useRef(false)
   const audioCtxRef = useRef<AudioContext | null>(null)
@@ -237,31 +237,35 @@ export function DisplayBoard() {
     }
   }, [rows, soundOn, announceDispatch])
 
-  // Watch the entry counters (1-4); announce whenever any one of them is
-  // called — a NEW token OR the same token re-called. Keyed off each entry
-  // counter's own called_at, which changes on every call and recall. Uses a
-  // per-counter ref (not a single shared ref) because the four counters are
-  // independent. Same synchronous-ref-update dedup as the dispatch effect to
+  // Watch the entry counters; announce whenever any one of them shows a NEW
+  // "now serving" token number. Entry Counters have NO recall/"Call Again"
+  // button — a token is announced exactly once, when its number first appears.
+  // So we key off the displayed token_number itself: a change in that number
+  // IS the only trigger. Re-displaying the same number does nothing (this
+  // naturally replaces any recall concept — there is none for entry counters).
+  //
+  // Per-counter ref (not shared) since each counter's number changes
+  // independently. Same synchronous-ref-update dedup as the dispatch effect to
   // close the realtime-vs-polling duplicate-trigger race.
   useEffect(() => {
     const entryRows = rows.filter((r) => r.station === "entry" && r.counter != null)
     for (const row of entryRows) {
       const counter = row.counter!
       const current = row.token_number
-      const calledAt = row.called_at
 
       if (!entryInitializedRef.current.has(counter)) {
-        // First sighting of this counter — record what's already on screen and
-        // skip announcing it, independently per counter (orders it may come in).
-        lastEntryCallRefs.current[counter] = calledAt
+        // First sighting of this counter — record what's already showing and
+        // skip announcing it, independently per counter (whatever order the
+        // rows arrive in).
+        lastEntryNumberRefs.current[counter] = current
         entryInitializedRef.current.add(counter)
         continue
       }
 
-      if (current !== null && calledAt !== null && calledAt !== lastEntryCallRefs.current[counter]) {
+      if (current !== null && current !== lastEntryNumberRefs.current[counter]) {
         // Update the ref synchronously BEFORE calling announceEntry so a
-        // polling check a few ms later sees the updated value and skips.
-        lastEntryCallRefs.current[counter] = calledAt
+        // polling check a few ms later sees the new value and skips.
+        lastEntryNumberRefs.current[counter] = current
         if (soundOn) void announceEntry(counter, current)
       }
     }
@@ -312,7 +316,7 @@ export function DisplayBoard() {
     // Prime each entry-counter audio element onto its own hardware channel,
     // exactly like the dispatch element above, so near-simultaneous calls
     // across counters each play on an already-primed channel.
-    for (const counter of [1, 2, 3, 4]) {
+    for (const counter of [1, 2, 3]) {
       const entryMedia = entryAudioRefs.current[counter]
       if (entryMedia) {
         void unlockAndPlay({
@@ -379,7 +383,7 @@ export function DisplayBoard() {
           entry counter so calls at different counters can play near-simultaneously
           without one aborting another on the shared element. Same TV-browser
           media attributes as the dispatch player. */}
-      {[1, 2, 3, 4].map((counter) => (
+      {[1, 2, 3].map((counter) => (
         <audio
           key={counter}
           ref={(el) => {
