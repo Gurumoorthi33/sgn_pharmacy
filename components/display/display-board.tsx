@@ -158,7 +158,7 @@ export function DisplayBoard() {
           console.log("[audio] duplicate announceDispatch call ignored for token", tokenNumber)
           return
         }
-        const audio = new Audio(`/audio/ta/announcement-${tokenNumber}.wav`)
+        const audio = new Audio(`/audio/ta/announcement-${tokenNumber}.mp3`)
         announceAudioRef.current = audio
         audio.play().catch((err) => console.error("[audio] announcement playback failed:", err))
       }, 450)
