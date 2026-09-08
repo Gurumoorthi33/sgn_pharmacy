@@ -49,6 +49,7 @@ export function DisplayBoard() {
   const lastDispatchCallRef = useRef<string | null>(null)
   const initializedRef = useRef(false)
   const audioCtxRef = useRef<AudioContext | null>(null)
+  const announceAudioRef = useRef<HTMLAudioElement | null>(null)
 
   // Load + subscribe to the live board
   useEffect(() => {
@@ -144,11 +145,21 @@ export function DisplayBoard() {
   // Audio decode path (decodeAudioData) is less reliably supported on embedded
   // Chromium builds (Silk on Fire TV) than the standard HTML5 <audio> tag,
   // which Amazon documents as fully supporting MP3/OGG/WAV.
+  //
+  // Belt-and-suspenders guard: the trigger (realtime + polling) can fire this
+  // twice for a single dispatch call. A shared Audio element whose .src is
+  // reassigned while the prior .play() promise is still pending throws an
+  // AbortError, so we skip playback if the same element is already playing.
   const announceDispatch = useCallback(
     (tokenNumber: number) => {
       void playChime()
       setTimeout(() => {
+        if (announceAudioRef.current && !announceAudioRef.current.paused) {
+          console.log("[audio] duplicate announceDispatch call ignored for token", tokenNumber)
+          return
+        }
         const audio = new Audio(`/audio/ta/announcement-${tokenNumber}.wav`)
+        announceAudioRef.current = audio
         audio.play().catch((err) => console.error("[audio] announcement playback failed:", err))
       }, 450)
     },
@@ -171,9 +182,12 @@ export function DisplayBoard() {
     }
 
     if (current !== null && calledAt !== null && calledAt !== lastDispatchCallRef.current) {
+      // Update the ref synchronously, BEFORE calling announceDispatch, so that
+      // if the polling check runs a few ms later (before announceDispatch
+      // finishes) it already sees the updated value and skips the second call.
+      lastDispatchCallRef.current = calledAt
       if (soundOn) void announceDispatch(current)
     }
-    lastDispatchCallRef.current = calledAt
   }, [rows, soundOn, announceDispatch])
 
   const enableSound = () => {
