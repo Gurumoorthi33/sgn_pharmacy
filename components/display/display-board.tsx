@@ -89,10 +89,10 @@ export function DisplayBoard() {
   }, [])
 
   // Lazily create or return the single AudioContext shared by the chime and
-  // MP3 playback. Silk on Fire TV only propagates an audio-unlock gesture to
-  // the AudioContext that was active at click-time — HTMLMediaElements created
-  // later via new Audio() stay muted. Both systems share one context so the
-  // unlock gesture covers everything.
+  // announcement playback. Silk on Fire TV only propagates an audio-unlock
+  // gesture to the AudioContext that was active at click-time — HTMLMediaElements
+  // created later via new Audio() stay muted. Both systems share one context so
+  // the unlock gesture covers everything.
   const getAudioContext = useCallback(() => {
     if (audioCtxRef.current) {
       console.log("[audio] getAudioContext: reusing existing ctx, state =", audioCtxRef.current.state)
@@ -140,67 +140,52 @@ export function DisplayBoard() {
     })
   }, [getAudioContext])
 
-  // Pre-fetch and decode all Tamil MP3 clips into AudioBuffer objects held in
-  // memory. Called once on the "Enable announcements" click gesture so every
-  // subsequent dispatch can play instantly with zero network latency.
-  const preloadAudioBuffers = async () => {
-    const ctx = getAudioContext()
-    if (!ctx) return
-    const paths = [
-      "/audio/ta/token-num.wav",
-      "/audio/ta/please-proceed.wav",
-      ...Array.from({ length: 100 }, (_, i) => `/audio/ta/num-${i}.wav`),
-    ]
-    await Promise.allSettled(
-      paths.map(async (path) => {
-        try {
-          const arrayBuffer = await fetch(path).then((r) => r.arrayBuffer())
-          const decoded = await ctx.decodeAudioData(arrayBuffer)
-          audioBuffersRef.current.set(path, decoded)
-          console.log(`[audio] decoded OK: ${path}, duration=${decoded.duration}`)
-        } catch (err) {
-          console.error(`[audio] DECODE FAILED for ${path}:`, err)
-        }
-      }),
-    )
-    console.log(
-      `[audio] preload complete: ${audioBuffersRef.current.size}/${paths.length} clips decoded`,
-    )
-  }
+  // Lazily fetch + decode a single pre-rendered announcement WAV into an
+  // AudioBuffer, caching it so recalled tokens replay instantly without
+  // refetching. One file per token number — no multi-clip chaining.
+  const getAnnouncementBuffer = useCallback(
+    async (tokenNumber: number) => {
+      const ctx = getAudioContext()
+      if (!ctx) return null
+      const path = `/audio/ta/announcement-${tokenNumber}.wav`
+      const cached = audioBuffersRef.current.get(path)
+      if (cached) return cached
+      try {
+        const arrayBuffer = await fetch(path).then((r) => r.arrayBuffer())
+        const decoded = await ctx.decodeAudioData(arrayBuffer)
+        audioBuffersRef.current.set(path, decoded)
+        console.log(`[audio] decoded OK: ${path}, duration=${decoded.duration}`)
+        return decoded
+      } catch (err) {
+        console.error(`[audio] DECODE FAILED for ${path}:`, err)
+        return null
+      }
+    },
+    [getAudioContext],
+  )
 
-  // Announce a dispatched token by playing pre-decoded Tamil AudioBuffers
-  // through the shared AudioContext. Queue: prefix → number → suffix, chained
-  // via AudioBufferSourceNode.onended so clips play back-to-back with no gaps.
-  const announceDispatch = useCallback((tokenNumber: number) => {
-    const ctx = getAudioContext()
-    if (!ctx) return
+  // Announce a dispatched token by playing the single pre-rendered Tamil
+  // announcement for that token number — one file, one AudioBufferSourceNode,
+  // no onended-chained sequence.
+  const announceDispatch = useCallback(
+    async (tokenNumber: number) => {
+      const ctx = getAudioContext()
+      if (!ctx) return
 
-    void playChime()
+      void playChime()
 
-    const paths = [
-      "/audio/ta/token-num.wav",
-      `/audio/ta/num-${tokenNumber}.wav`,
-      "/audio/ta/please-proceed.wav",
-    ]
-    const buffers = paths
-      .map((p) => audioBuffersRef.current.get(p))
-      .filter(Boolean) as AudioBuffer[]
-    if (buffers.length === 0) {
-      console.warn("[audio] announceDispatch: buffers not ready, chime only")
-      return
-    }
-
-    const playNext = (i: number) => {
-      if (i >= buffers.length) return
+      const buffer = await getAnnouncementBuffer(tokenNumber)
+      if (!buffer) {
+        console.warn(`[audio] announceDispatch: buffer not ready for token ${tokenNumber}, chime only`)
+        return
+      }
       const source = ctx.createBufferSource()
-      source.buffer = buffers[i]
+      source.buffer = buffer
       source.connect(ctx.destination)
-      source.onended = () => playNext(i + 1)
       source.start()
-    }
-
-    setTimeout(() => playNext(0), 450)
-  }, [playChime, getAudioContext])
+    },
+    [playChime, getAudioContext, getAnnouncementBuffer],
+  )
 
   // Watch the dispatch counter; announce whenever it is called — a NEW token
   // OR the same token re-called ("Call again"). We key off dispatch_called_at,
@@ -218,7 +203,7 @@ export function DisplayBoard() {
     }
 
     if (current !== null && calledAt !== null && calledAt !== lastDispatchCallRef.current) {
-      if (soundOn) announceDispatch(current)
+      if (soundOn) void announceDispatch(current)
     }
     lastDispatchCallRef.current = calledAt
   }, [rows, soundOn, announceDispatch])
@@ -253,8 +238,6 @@ export function DisplayBoard() {
     // interrupt the synchronous gesture processing. Doing it last preserves
     // the uninterrupted audio-unlock block.
     setSoundOn(true)
-    // Async fetch/decode of MP3 buffers runs AFTER the unlock+chime block.
-    void preloadAudioBuffers()
   }
 
   const timeText = now

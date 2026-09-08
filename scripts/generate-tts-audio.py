@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Generate Tamil announcement clips as WAV using gTTS + pydub.
+"""Generate pre-rendered Tamil token announcements as single WAV files.
 
 Run once manually on a dev machine (not at request-time). Output clips are
 committed to the repo as static assets under public/audio/ta/.
+
+Each token number gets ONE continuous file containing the full sentence:
+    "Token எண் {N}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
+e.g. announcement-5.wav = "Token எண் 5, தயவுசெய்து ...". The display board
+plays a single buffer per announcement — no multi-clip chaining needed.
 
 gTTS only emits MP3 directly, so we pipe its output through pydub (which
 shells out to ffmpeg) to convert to uncompressed PCM WAV at 44100 Hz.
@@ -23,10 +28,8 @@ Requirements:
 Usage:
     python scripts/generate-tts-audio.py
 
-Generated files (whole-number natural pronunciation for tokens 0-99):
-    public/audio/ta/token-num.wav        "Token எண்"
-    public/audio/ta/please-proceed.wav   "தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
-    public/audio/ta/num-{0..99}.wav      "0" ... "99"
+Generated files (tokens 0-99):
+    public/audio/ta/announcement-{0..99}.wav
 """
 
 import io
@@ -51,19 +54,23 @@ AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "public" / "audio" / "ta"
 
-PREFIX = "Token எண்"
-SUFFIX = "தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
+# Full sentence, pre-rendered per token number as one continuous clip.
+ANNOUNCEMENT_TEMPLATE = (
+    "Token எண் {token_number}, "
+    "தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்"
+)
 
 # 0 and 99 included, though max single-day count is realistically far lower.
 MAX_NUM = 99
 
 
-def save_as_wav(text: str, filename: str) -> None:
+def generate_announcement(token_number: int) -> None:
+    text = ANNOUNCEMENT_TEMPLATE.format(token_number=token_number)
     mp3_buffer = io.BytesIO()
     gTTS(text=text, lang="ta").write_to_fp(mp3_buffer)
     mp3_buffer.seek(0)
     audio = AudioSegment.from_mp3(mp3_buffer)
-    path = OUTPUT_DIR / f"{filename}.wav"
+    path = OUTPUT_DIR / f"announcement-{token_number}.wav"
     audio.export(str(path), format="wav", parameters=["-ar", "44100"])
     print(f"wrote {path.relative_to(Path.cwd())}")
 
@@ -71,13 +78,10 @@ def save_as_wav(text: str, filename: str) -> None:
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    clips = [(PREFIX, "token-num"), (SUFFIX, "please-proceed")]
-    clips += [(str(i), f"num-{i}") for i in range(MAX_NUM + 1)]
+    for i in range(MAX_NUM + 1):
+        generate_announcement(i)
 
-    for text, base in clips:
-        save_as_wav(text, base)
-
-    print(f"done — {len(clips)} wav clips written to {OUTPUT_DIR}")
+    print(f"done — {MAX_NUM + 1} announcement wav files written to {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
