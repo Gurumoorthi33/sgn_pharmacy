@@ -229,11 +229,11 @@ export function DisplayBoard() {
     // Build the Tamil announcement text per counter type
     let text = ""
     if (next.type === "dispatch") {
-      text = `Token எண் ${next.tokenNumber}, தயவுசெய்து மருந்து வழங்கும் கவுண்டருக்கு வரவும்`
+      text = `Token எண் ${next.tokenNumber}, மருந்து வழங்கும் கவுண்டருக்கு வரவும்`
     } else if (next.type === "entry") {
       text = `Token எண் ${next.tokenNumber}, பதிவு கவுண்டர் ${next.counterNumber}-க்கு வரவும்`
     } else if (next.type === "payment") {
-      text = `Token எண் ${next.tokenNumber}, தயவுசெய்து பணம் செலுத்தும் கவுண்டருக்கு வரவும்`
+      text = `Token எண் ${next.tokenNumber}, பணம் செலுத்தும் கவுண்டருக்கு வரவும்`
     }
 
     console.log("[audio] announcement text:", text)
