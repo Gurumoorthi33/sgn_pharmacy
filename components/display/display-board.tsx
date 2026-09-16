@@ -117,6 +117,57 @@ export function DisplayBoard() {
     return () => clearInterval(id)
   }, [])
 
+  // Feature-detect Tamil TTS on mount. SpeechSynthesis voices load
+  // asynchronously; check both on mount and after voiceschanged fires.
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return
+    }
+
+    const checkVoices = () => {
+      const voices = speechSynthesis.getVoices()
+      console.log("[tts] available voices:", voices.map((voice) => `${voice.name} (${voice.lang})`))
+      const hasTamil = voices.some((voice) => voice.lang.startsWith("ta"))
+      console.log("[tts] Tamil voice available:", hasTamil)
+    }
+
+    checkVoices()
+    speechSynthesis.addEventListener("voiceschanged", checkVoices)
+    return () => speechSynthesis.removeEventListener("voiceschanged", checkVoices)
+  }, [])
+
+  // Speak a Tamil announcement and always resolve so the queue continues.
+  const speakAnnouncement = useCallback((text: string): Promise<void> => {
+    return new Promise<void>((resolve) => {
+      if (!("speechSynthesis" in window)) {
+        console.error("[tts] speechSynthesis not available")
+        resolve()
+        return
+      }
+
+      console.log("[tts] speaking:", text)
+      const utterance = new SpeechSynthesisUtterance(text)
+      const tamilVoice = speechSynthesis.getVoices().find((voice) => voice.lang.startsWith("ta"))
+      if (tamilVoice) {
+        console.log("[tts] using voice:", tamilVoice.name, tamilVoice.lang)
+        utterance.voice = tamilVoice
+      }
+      utterance.lang = "ta-IN"
+      utterance.rate = 0.85
+
+      utterance.onend = () => {
+        console.log("[tts] utterance ended")
+        resolve()
+      }
+      utterance.onerror = (error) => {
+        console.error("[tts] utterance error:", error)
+        resolve()
+      }
+
+      speechSynthesis.speak(utterance)
+    })
+  }, [])
+
   // Play a two-note chime using Web Audio API (pure tones, no media element).
   const playChime = useCallback(() => {
     if (typeof window === "undefined") return
@@ -165,14 +216,31 @@ export function DisplayBoard() {
     isPlayingRef.current = true
     console.log("[audio] processQueue: playing", next, "queue =", audioQueueRef.current.length)
 
-    // Keep the audible chime while Tamil voice announcements are unavailable.
+    let text = ""
+    if (next.type === "dispatch") {
+      text = `Token எண் ${next.tokenNumber}, மருந்து வழங்கும் கவுண்டருக்கு வரவும்`
+    } else if (next.type === "entry") {
+      text = `Token எண் ${next.tokenNumber}, பதிவு கவுண்டர் ${next.counterNumber}-க்கு வரவும்`
+    } else if (next.type === "payment") {
+      text = `Token எண் ${next.tokenNumber}, பணம் செலுத்தும் கவுண்டருக்கு வரவும்`
+    }
+
+    console.log("[audio] announcement text:", text)
     playChime()
 
+    // Speak after the chime while preserving FIFO queue order.
     setTimeout(() => {
-      isPlayingRef.current = false
-      processQueueRef.current()
+      speakAnnouncement(text)
+        .then(() => {
+          isPlayingRef.current = false
+          processQueueRef.current()
+        })
+        .catch(() => {
+          isPlayingRef.current = false
+          processQueueRef.current()
+        })
     }, 450)
-  }, [playChime])
+  }, [playChime, speakAnnouncement])
 
   // Keep the latest processQueue closure accessible to its own async handlers.
   useEffect(() => {
