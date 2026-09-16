@@ -4,7 +4,7 @@ import Image from "next/image"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createClient } from "@/lib/supabase/client"
 import { HOSPITAL_NAME, SYSTEM_NAME } from "@/lib/types"
-import { Volume2, AlertTriangle } from "lucide-react"
+import { Volume2 } from "lucide-react"
 
 type DisplayRow = {
   station: "entry" | "payment" | "dispatch"
@@ -395,14 +395,6 @@ export function DisplayBoard() {
           </div>
         </div>
       </header>
-
-      <div className="flex items-center gap-3 border-b-2 border-amber-200 bg-amber-50 px-8 py-3">
-        <AlertTriangle className="h-5 w-5 flex-shrink-0 text-amber-600" aria-hidden="true" />
-        <p className="text-sm font-medium text-amber-900">
-          Tamil voice announcements unavailable on this device. Please check browser TTS settings or use a device with
-          Tamil language support installed.
-        </p>
-      </div>
 
       {/* Six-counter grid */}
       <section className="grid flex-1 grid-cols-2 gap-4 border-t-2 border-black/10 p-6 md:grid-cols-3 lg:grid-cols-6">
