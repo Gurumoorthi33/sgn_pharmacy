@@ -23,12 +23,13 @@ export function AdminDashboard() {
   const entry1 = entryCount(1)
   const entry2 = entryCount(2)
   const entry3 = entryCount(3)
+  const entry4 = entryCount(4)
   const entryDone = tokens.filter((t) => t.entry_completed_at !== null).length
   const paymentDone = tokens.filter((t) => t.payment_completed_at !== null).length
   const dispatchDone = tokens.filter((t) => t.status === "completed").length
   const inProgress = tokens.filter((t) => t.status !== "completed").length
 
-  const maxEntry = Math.max(entry1, entry2, entry3, 1)
+  const maxEntry = Math.max(entry1, entry2, entry3, entry4, 1)
 
   function handleDownload() {
     setMsg(null)
@@ -98,6 +99,7 @@ export function AdminDashboard() {
               { label: "Counter 1", value: entry1 },
               { label: "Counter 2", value: entry2 },
               { label: "Counter 3", value: entry3 },
+              { label: "Counter 4", value: entry4 },
             ].map((row) => (
               <div key={row.label} className="flex flex-col gap-1">
                 <div className="flex items-center justify-between text-sm">

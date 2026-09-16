@@ -4,7 +4,7 @@
 
 ### Removed (MP3 System)
 - ❌ `scripts/generate-tts-audio.py` (deleted)
-- ❌ `scripts/migration_recall_entry_payment.sql` (deleted — Entry/Payment recall still needs DB migration if not already applied)
+- ❌ `scripts/migration_recall_entry_payment.sql` (deleted — superseded by `scripts/migration_entry4_recall_fix.sql`, created 2026-09-16; run it in Supabase SQL Editor to enable Entry/Payment recall)
 - ❌ `public/audio/` directory (1600 MP3 files, ~109 MB deleted)
 - ❌ `lib/audio-unlock.ts` (deleted)
 - ❌ `vercel.json` audio MIME-type headers (removed)

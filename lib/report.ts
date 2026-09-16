@@ -10,6 +10,7 @@ export type DayStats = {
   entry_1: number
   entry_2: number
   entry_3: number
+  entry_4: number
   entry_done: number
   payment_done: number
   dispatch_done: number
@@ -34,6 +35,7 @@ export function buildCsv(date: string, s: DayStats): string {
     ["Entry Counter 1 served", s.entry_1],
     ["Entry Counter 2 served", s.entry_2],
     ["Entry Counter 3 served", s.entry_3],
+    ["Entry Counter 4 served", s.entry_4 ?? 0],
     ["Entry completed (total)", s.entry_done],
     ["Payment completed", s.payment_done],
     ["Dispatch completed", s.dispatch_done],
@@ -80,6 +82,7 @@ export async function emailDailyReport(date: string, s: DayStats): Promise<boole
       <tr><td>Entry Counter 1</td><td>${s.entry_1}</td></tr>
       <tr><td>Entry Counter 2</td><td>${s.entry_2}</td></tr>
       <tr><td>Entry Counter 3</td><td>${s.entry_3}</td></tr>
+      <tr><td>Entry Counter 4</td><td>${s.entry_4 ?? 0}</td></tr>
       <tr><td>Payment completed</td><td>${s.payment_done}</td></tr>
       <tr><td>Dispatch completed</td><td>${s.dispatch_done}</td></tr>
     </table>

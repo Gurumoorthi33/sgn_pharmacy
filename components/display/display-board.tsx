@@ -58,7 +58,9 @@ export function DisplayBoard() {
   const [lang, setLang] = useState<Lang>("en")
   const [now, setNow] = useState<Date | null>(null)
   const [soundOn, setSoundOn] = useState(false)
-  const [ttsAvailable, setTtsAvailable] = useState<boolean | null>(null)
+  const [ttsAvailable, setTtsAvailable] = useState<boolean | null>(() =>
+    typeof window === "undefined" || !("speechSynthesis" in window) ? false : null,
+  )
 
   // Dispatch: keyed off called_at (changes on every call AND recall)
   const lastDispatchCallRef = useRef<string | null>(null)
@@ -77,6 +79,7 @@ export function DisplayBoard() {
 
   // Payment: recall trigger (keyed off recalled_at)
   const lastPaymentRecallRef = useRef<string | null>(null)
+  const paymentRecallInitializedRef = useRef(false)
 
   const audioQueueRef = useRef<QueueItem[]>([])
   const isPlayingRef = useRef(false)
@@ -121,7 +124,6 @@ export function DisplayBoard() {
   // asynchronously; we check both on mount and after voiceschanged fires.
   useEffect(() => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
-      setTtsAvailable(false)
       return
     }
 
@@ -229,11 +231,11 @@ export function DisplayBoard() {
     // Build the Tamil announcement text per counter type
     let text = ""
     if (next.type === "dispatch") {
-      text = `Token எண் ${next.tokenNumber}, மருந்து வழங்கும் கவுண்டருக்கு வரவும்`
+      text = `Token எண் ${next.tokenNumber}, மருந்து வழங்கும் கவுண்டர்க்கு வரவும்`
     } else if (next.type === "entry") {
       text = `Token எண் ${next.tokenNumber}, பதிவு கவுண்டர் ${next.counterNumber}-க்கு வரவும்`
     } else if (next.type === "payment") {
-      text = `Token எண் ${next.tokenNumber}, பணம் செலுத்தும் கவுண்டருக்கு வரவும்`
+      text = `Token எண் ${next.tokenNumber}, பணம் செலுத்தும் கவுண்டர்க்கு  வரவும்`
     }
 
     console.log("[audio] announcement text:", text)
@@ -391,12 +393,14 @@ export function DisplayBoard() {
 
     if (!paymentInitializedRef.current) return
 
-    if (lastPaymentRecallRef.current === null && recalledAt === null) {
+    // First observation of the payment row: record the baseline without
+    // announcing (avoids a false announcement on mount/reload). A later,
+    // separate change of recalled_at — including the FIRST "Call Again"
+    // press — must announce, so the baseline is only recorded here, never in
+    // the comparison below.
+    if (!paymentRecallInitializedRef.current) {
       lastPaymentRecallRef.current = recalledAt
-      return
-    }
-    if (lastPaymentRecallRef.current === null) {
-      lastPaymentRecallRef.current = recalledAt
+      paymentRecallInitializedRef.current = true
       return
     }
 
@@ -434,6 +438,7 @@ export function DisplayBoard() {
   const entry1 = rows.find((r) => r.station === "entry" && r.counter === 1) ?? null
   const entry2 = rows.find((r) => r.station === "entry" && r.counter === 2) ?? null
   const entry3 = rows.find((r) => r.station === "entry" && r.counter === 3) ?? null
+  const entry4 = rows.find((r) => r.station === "entry" && r.counter === 4) ?? null
   const paymentRow = rows.find((r) => r.station === "payment") ?? null
   const dispatchRow = rows.find((r) => r.station === "dispatch") ?? null
 
@@ -485,11 +490,12 @@ export function DisplayBoard() {
         </div>
       )}
 
-      {/* Five-counter grid */}
-      <section className="grid flex-1 grid-cols-2 gap-4 border-t-2 border-black/10 p-6 lg:grid-cols-5">
+      {/* Six-counter grid */}
+      <section className="grid flex-1 grid-cols-2 gap-4 border-t-2 border-black/10 p-6 md:grid-cols-3 lg:grid-cols-6">
         <CounterTile label={stationTitle("entry", 1)} value={entry1?.token_number ?? null} accent="blue" empty={t.waiting} />
         <CounterTile label={stationTitle("entry", 2)} value={entry2?.token_number ?? null} accent="blue" empty={t.waiting} />
         <CounterTile label={stationTitle("entry", 3)} value={entry3?.token_number ?? null} accent="blue" empty={t.waiting} />
+        <CounterTile label={stationTitle("entry", 4)} value={entry4?.token_number ?? null} accent="blue" empty={t.waiting} />
         <CounterTile label={t.payment} value={paymentRow?.token_number ?? null} accent="black" empty={t.waiting} />
         <CounterTile label={t.dispatch} value={dispatchRow?.token_number ?? null} accent="green" empty={t.waiting} highlight />
       </section>

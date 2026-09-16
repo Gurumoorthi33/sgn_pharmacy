@@ -55,6 +55,9 @@ export const usernameToEmail = (username: string) =>
 export const DISPATCH_RESET_TIME = "23:40" // 11:40 PM IST daily reset
 export const REPORT_RECIPIENTS = ["supervisor.trc@sgnpharmacy.com", "manager.trc@sgnpharmacy.com"]
 
+export const ENTRY_COUNTERS = [1, 2, 3, 4] as const
+export const ENTRY_COUNTER_COUNT = ENTRY_COUNTERS.length
+
 export const HOSPITAL_NAME = "Trichy SRM Medical College Hospital and Research Centre"
 export const HOSPITAL_SHORT = "Trichy SRM Medical College Hospital and Research Centre"
 export const SYSTEM_NAME = "SGN Token System"
