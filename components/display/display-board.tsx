@@ -438,7 +438,7 @@ export function DisplayBoard() {
       {/* Header */}
       <header className="flex items-center justify-between gap-4 border-b-2 border-black/10 px-8 py-4">
         <div className="flex items-center gap-4">
-          <Image src="/sgn-logo.png" alt="SGN Pharmacy" width={200} height={80} priority className="h-14 w-auto" />
+          <Image src="/trichy_srm_hospital.jpeg" alt="Trichy SRM Hospital" width={200} height={100} priority className="h-14 w-auto" />
           <div>
             <h1 className="text-balance text-xl font-bold leading-tight text-black lg:text-2xl">{t.hospital}</h1>
             <p className="text-sm font-medium text-[#1d4ed8]">{t.system}</p>
@@ -455,6 +455,7 @@ export function DisplayBoard() {
               Enable announcements
             </button>
           ) : null}
+          <Image src="/sgn-logo.png" alt="SGN Pharmacy" width={200} height={80} priority className="h-14 w-auto" />
           <div className="text-right">
             <div className="font-mono text-3xl font-bold tabular-nums text-black">
               {timeText}
