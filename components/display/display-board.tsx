@@ -1,7 +1,7 @@
 "use client"
 
 import Image from "next/image"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createClient } from "@/lib/supabase/client"
 import { HOSPITAL_NAME, SYSTEM_NAME } from "@/lib/types"
 import { Volume2 } from "lucide-react"
@@ -35,7 +35,8 @@ const STRINGS = {
     dispatch: "Dispatch Counter",
     token: "Token",
     idle: "Please wait for your token to be called",
-    waiting: "-",
+    available: "Available",
+    proceed: "Please proceed",
   },
   ta: {
     hospital: "திருச்சி எஸ்ஆர்எம் மருத்துவக் கல்லூரி மருத்துவமனை மற்றும் ஆராய்ச்சி மையம்",
@@ -46,11 +47,14 @@ const STRINGS = {
     dispatch: "மருந்து வழங்கும் கவுண்டர்",
     token: "டோக்கன்",
     idle: "உங்கள் டோக்கன் அழைக்கப்படும் வரை காத்திருக்கவும்",
-    waiting: "-",
+    available: "தயாராக உள்ளது",
+    proceed: "தயவுசெய்து வரவும்",
   },
 } as const
 
 type Lang = keyof typeof STRINGS
+
+const ENTRY_COUNTERS = [1, 2, 3, 4]
 
 export function DisplayBoard() {
   const supabase = useMemo(() => createClient(), [])
@@ -420,28 +424,24 @@ export function DisplayBoard() {
 
   const t = STRINGS[lang]
 
-  const entry1 = rows.find((r) => r.station === "entry" && r.counter === 1) ?? null
-  const entry2 = rows.find((r) => r.station === "entry" && r.counter === 2) ?? null
-  const entry3 = rows.find((r) => r.station === "entry" && r.counter === 3) ?? null
-  const entry4 = rows.find((r) => r.station === "entry" && r.counter === 4) ?? null
-  const paymentRow = rows.find((r) => r.station === "payment") ?? null
-  const dispatchRow = rows.find((r) => r.station === "dispatch") ?? null
+  const counterValue = (station: DisplayRow["station"], counter?: number) =>
+    rows.find((r) => r.station === station && (counter === undefined || r.counter === counter))?.token_number ?? null
 
-  const stationTitle = (s: DisplayRow["station"], counter: number | null) => {
-    if (s === "entry") return `${t.entry} ${counter ?? ""}`.trim()
-    if (s === "payment") return t.payment
-    return t.dispatch
-  }
+  const counters: { key: string; kind: DisplayRow["station"]; label: string; value: number | null }[] = [
+    ...ENTRY_COUNTERS.map((n) => ({ key: `entry-${n}`, kind: "entry" as const, label: `${t.entry} ${n}`, value: counterValue("entry", n) })),
+    { key: "payment", kind: "payment", label: t.payment, value: counterValue("payment") },
+    { key: "dispatch", kind: "dispatch", label: t.dispatch, value: counterValue("dispatch") },
+  ]
 
   return (
-    <main className="flex min-h-screen flex-col bg-white text-black">
+    <main lang={lang} className="flex min-h-screen flex-col bg-(--display-bg) text-black">
       {/* Header */}
-      <header className="flex flex-wrap items-center justify-between gap-4 border-b-2 border-black/10 px-4 py-4 sm:px-8">
+      <header className="flex flex-wrap items-center justify-between gap-4 border-b-4 border-(--display-accent) bg-white px-4 py-4 sm:px-8">
         <div className="flex items-center gap-4">
           <Image src="/trichy_srm_hospital.png" alt="Trichy SRM Hospital" width={200} height={100} priority className="h-16 w-auto" />
           <div>
             <h1 className="text-balance text-xl font-bold leading-tight text-black lg:text-2xl">{t.hospital}</h1>
-            <p className="text-sm font-medium text-[#1d4ed8]">{t.system}</p>
+            <p className="text-sm font-medium text-(--display-accent)">{t.system}</p>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-4 sm:gap-6">
@@ -449,7 +449,7 @@ export function DisplayBoard() {
             <button
               type="button"
               onClick={enableSound}
-              className="flex items-center gap-2 rounded-lg bg-[#1d4ed8] px-4 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-[#1d4ed8]/90"
+              className="flex items-center gap-2 rounded-lg bg-(--display-accent) px-4 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-(--display-accent)/90"
             >
               <Volume2 className="h-4 w-4" aria-hidden="true" />
               Enable announcements
@@ -465,43 +465,56 @@ export function DisplayBoard() {
         </div>
       </header>
 
-      {/* Six-counter grid: hidden below 600px, 2 cols 600-699, 3 cols 700-1199, 6 in one row from 1200 */}
-      <section className="hidden flex-1 auto-rows-fr gap-4 border-t-2 border-black/10 p-6 min-[600px]:grid min-[600px]:grid-cols-[repeat(2,minmax(0,1fr))] min-[700px]:grid-cols-[repeat(3,minmax(0,1fr))] min-[1200px]:grid-cols-[repeat(6,minmax(0,1fr))]">
-        <CounterTile label={stationTitle("entry", 1)} value={entry1?.token_number ?? null} accent="blue" empty={t.waiting} />
-        <CounterTile label={stationTitle("entry", 2)} value={entry2?.token_number ?? null} accent="blue" empty={t.waiting} />
-        <CounterTile label={stationTitle("entry", 3)} value={entry3?.token_number ?? null} accent="blue" empty={t.waiting} />
-        <CounterTile label={stationTitle("entry", 4)} value={entry4?.token_number ?? null} accent="blue" empty={t.waiting} />
-        <CounterTile label={t.payment} value={paymentRow?.token_number ?? null} accent="blue" empty={t.waiting} />
-        <CounterTile label={t.dispatch} value={dispatchRow?.token_number ?? null} accent="blue" empty={t.waiting} highlight />
+      {/* Counter grid: hidden below 600px, 2 cols 600-699, 3 cols 700-1199, one row of all counters from 1200 */}
+      <section className="hidden flex-1 auto-rows-fr gap-[22px] p-6 min-[600px]:grid min-[600px]:grid-cols-[repeat(2,minmax(0,1fr))] min-[700px]:grid-cols-[repeat(3,minmax(0,1fr))] min-[1200px]:auto-cols-fr min-[1200px]:grid-flow-col min-[1200px]:grid-cols-none">
+        {counters.map((c) => (
+          // Keyed by token so a new number remounts the card and replays the attention pulse
+          <CounterTile key={`${c.key}-${c.value ?? "idle"}`} kind={c.kind} label={c.label} value={c.value} t={t} />
+        ))}
       </section>
     </main>
   )
 }
 
 function CounterTile({
+  kind,
   label,
   value,
-  accent,
-  empty,
-  highlight,
+  t,
 }: {
+  kind: DisplayRow["station"]
   label: string
   value: number | null
-  accent: "blue" | "black" | "green"
-  empty: string
-  highlight?: boolean
+  t: (typeof STRINGS)[Lang]
 }) {
-  const color = accent === "blue" ? "text-[#1d4ed8]" : accent === "green" ? "text-[#15803d]" : "text-black"
-  const ring = highlight ? "border-[#15803d]/40 bg-[#15803d]/5" : "border-black/10 bg-black/[0.02]"
+  const serving = value !== null
+  const state = serving ? "counter-card--serving counter-card--attention" : ""
 
   return (
-    <div className={`flex min-h-56 min-w-0 flex-col items-center justify-center rounded-2xl border-2 p-5 text-center ${ring}`}>
-      <div className="mb-3 text-base font-bold uppercase tracking-wide text-black/70 text-balance break-words">{label}</div>
-      {value !== null ? (
-        <span className={`font-mono text-[clamp(3rem,9vw,7rem)] font-extrabold leading-none tabular-nums min-[1200px]:text-[clamp(3.5rem,5vw,7rem)] ${color}`}>{value}</span>
-      ) : (
-        <span className="font-mono text-[clamp(2.5rem,7vw,6rem)] font-bold leading-none tabular-nums text-black/20 min-[1200px]:text-[clamp(3rem,4vw,6rem)]">{empty}</span>
-      )}
+    <div className={`counter-card counter-card--${kind} ${state}`}>
+      <div className="counter-card__header">{label}</div>
+      <div className="counter-card__body">
+        {serving ? (
+          <>
+            <span className="counter-card__label">{t.nowServing}</span>
+            <span className="counter-card__number" style={{ "--digits": String(value).length } as CSSProperties}>
+              {value}
+            </span>
+          </>
+        ) : (
+          <span className="counter-card__idle">{t.available}</span>
+        )}
+      </div>
+      <div className="counter-card__footer">
+        {serving ? (
+          <>
+            <span className="counter-card__dot" aria-hidden="true" />
+            {t.proceed}
+          </>
+        ) : (
+          "—"
+        )}
+      </div>
     </div>
   )
 }
