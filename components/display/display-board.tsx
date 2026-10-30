@@ -35,7 +35,7 @@ const STRINGS = {
     dispatch: "Dispatch Counter",
     token: "Token",
     idle: "Please wait for your token to be called",
-    waiting: "—",
+    waiting: "-",
   },
   ta: {
     hospital: "திருச்சி எஸ்ஆர்எம் மருத்துவக் கல்லூரி மருத்துவமனை மற்றும் ஆராய்ச்சி மையம்",
@@ -46,7 +46,7 @@ const STRINGS = {
     dispatch: "மருந்து வழங்கும் கவுண்டர்",
     token: "டோக்கன்",
     idle: "உங்கள் டோக்கன் அழைக்கப்படும் வரை காத்திருக்கவும்",
-    waiting: "—",
+    waiting: "-",
   },
 } as const
 
@@ -436,7 +436,7 @@ export function DisplayBoard() {
   return (
     <main className="flex min-h-screen flex-col bg-white text-black">
       {/* Header */}
-      <header className="flex items-center justify-between gap-4 border-b-2 border-black/10 px-8 py-4">
+      <header className="flex flex-wrap items-center justify-between gap-4 border-b-2 border-black/10 px-4 py-4 sm:px-8">
         <div className="flex items-center gap-4">
           <Image src="/trichy_srm_hospital.png" alt="Trichy SRM Hospital" width={200} height={100} priority className="h-16 w-auto" />
           <div>
@@ -444,7 +444,7 @@ export function DisplayBoard() {
             <p className="text-sm font-medium text-[#1d4ed8]">{t.system}</p>
           </div>
         </div>
-        <div className="flex items-center gap-6">
+        <div className="flex flex-wrap items-center gap-4 sm:gap-6">
           {!soundOn ? (
             <button
               type="button"
@@ -465,14 +465,14 @@ export function DisplayBoard() {
         </div>
       </header>
 
-      {/* Six-counter grid */}
-      <section className="grid flex-1 grid-cols-2 gap-4 border-t-2 border-black/10 p-6 md:grid-cols-3 lg:grid-cols-6">
+      {/* Six-counter grid: hidden below 600px, 2 cols 600-699, 3 cols 700-1199, 6 in one row from 1200 */}
+      <section className="hidden flex-1 auto-rows-fr gap-4 border-t-2 border-black/10 p-6 min-[600px]:grid min-[600px]:grid-cols-[repeat(2,minmax(0,1fr))] min-[700px]:grid-cols-[repeat(3,minmax(0,1fr))] min-[1200px]:grid-cols-[repeat(6,minmax(0,1fr))]">
         <CounterTile label={stationTitle("entry", 1)} value={entry1?.token_number ?? null} accent="blue" empty={t.waiting} />
         <CounterTile label={stationTitle("entry", 2)} value={entry2?.token_number ?? null} accent="blue" empty={t.waiting} />
         <CounterTile label={stationTitle("entry", 3)} value={entry3?.token_number ?? null} accent="blue" empty={t.waiting} />
         <CounterTile label={stationTitle("entry", 4)} value={entry4?.token_number ?? null} accent="blue" empty={t.waiting} />
-        <CounterTile label={t.payment} value={paymentRow?.token_number ?? null} accent="black" empty={t.waiting} />
-        <CounterTile label={t.dispatch} value={dispatchRow?.token_number ?? null} accent="green" empty={t.waiting} highlight />
+        <CounterTile label={t.payment} value={paymentRow?.token_number ?? null} accent="blue" empty={t.waiting} />
+        <CounterTile label={t.dispatch} value={dispatchRow?.token_number ?? null} accent="blue" empty={t.waiting} highlight />
       </section>
     </main>
   )
@@ -492,15 +492,15 @@ function CounterTile({
   highlight?: boolean
 }) {
   const color = accent === "blue" ? "text-[#1d4ed8]" : accent === "green" ? "text-[#15803d]" : "text-black"
-  const ring = highlight ? "border-[#15803d] bg-[#15803d]/5" : "border-black/10 bg-black/[0.02]"
+  const ring = highlight ? "border-[#15803d]/40 bg-[#15803d]/5" : "border-black/10 bg-black/[0.02]"
 
   return (
-    <div className={`flex flex-col items-center justify-center rounded-2xl border-2 p-5 text-center ${ring}`}>
-      <div className="mb-2 text-base font-bold uppercase tracking-wide text-black/70 text-balance">{label}</div>
+    <div className={`flex min-h-56 min-w-0 flex-col items-center justify-center rounded-2xl border-2 p-5 text-center ${ring}`}>
+      <div className="mb-3 text-base font-bold uppercase tracking-wide text-black/70 text-balance break-words">{label}</div>
       {value !== null ? (
-        <span className={`font-mono text-7xl font-extrabold leading-none tabular-nums ${color}`}>{value}</span>
+        <span className={`font-mono text-[clamp(3rem,9vw,7rem)] font-extrabold leading-none tabular-nums min-[1200px]:text-[clamp(3.5rem,5vw,7rem)] ${color}`}>{value}</span>
       ) : (
-        <span className="font-mono text-6xl font-bold leading-none tabular-nums text-black/20">{empty}</span>
+        <span className="font-mono text-[clamp(2.5rem,7vw,6rem)] font-bold leading-none tabular-nums text-black/20 min-[1200px]:text-[clamp(3rem,4vw,6rem)]">{empty}</span>
       )}
     </div>
   )
