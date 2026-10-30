@@ -107,6 +107,12 @@ export function DisplayBoard() {
     }
   }, [supabase])
 
+  // Lock html/body to exactly one screen (no scrollbars) while the board is shown
+  useEffect(() => {
+    document.documentElement.classList.add("display-mode")
+    return () => document.documentElement.classList.remove("display-mode")
+  }, [])
+
   // Auto language switch every 7s
   useEffect(() => {
     const id = setInterval(() => setLang((l) => (l === "en" ? "ta" : "en")), 7000)
@@ -434,39 +440,33 @@ export function DisplayBoard() {
   ]
 
   return (
-    <main lang={lang} className="flex min-h-screen flex-col bg-(--display-bg) text-black">
+    <main lang={lang} className="display-screen">
       {/* Header */}
-      <header className="flex flex-wrap items-center justify-between gap-4 border-b-4 border-(--display-accent) bg-white px-4 py-4 sm:px-8">
-        <div className="flex items-center gap-4">
-          <Image src="/trichy_srm_hospital.png" alt="Trichy SRM Hospital" width={200} height={100} priority className="h-16 w-auto" />
-          <div>
-            <h1 className="text-balance text-xl font-bold leading-tight text-black lg:text-2xl">{t.hospital}</h1>
-            <p className="text-sm font-medium text-(--display-accent)">{t.system}</p>
+      <header className="display-header">
+        <div className="display-header__brand">
+          <Image src="/trichy_srm_hospital.png" alt="Trichy SRM Hospital" width={200} height={100} priority className="display-header__logo" />
+          <div className="min-w-0">
+            <h1 className="display-header__title">{t.hospital}</h1>
+            <p className="display-header__subtitle">{t.system}</p>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-4 sm:gap-6">
+        <div className="display-header__side">
           {!soundOn ? (
-            <button
-              type="button"
-              onClick={enableSound}
-              className="flex items-center gap-2 rounded-lg bg-(--display-accent) px-4 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-(--display-accent)/90"
-            >
-              <Volume2 className="h-4 w-4" aria-hidden="true" />
+            <button type="button" onClick={enableSound} className="display-header__sound">
+              <Volume2 aria-hidden="true" />
               Enable announcements
             </button>
           ) : null}
-          <Image src="/sgn-logo.png" alt="SGN Pharmacy" width={200} height={80} priority className="h-14 w-auto" />
-          <div className="text-right">
-            <div className="font-mono text-3xl font-bold tabular-nums text-black">
-              {timeText}
-            </div>
-            <div className="text-sm text-black/50">{dateText}</div>
+          <Image src="/sgn-logo.png" alt="SGN Pharmacy" width={200} height={80} priority className="display-header__logo display-header__logo--sgn" />
+          <div className="display-header__clock">
+            <div className="display-header__time">{timeText}</div>
+            <div className="display-header__date">{dateText}</div>
           </div>
         </div>
       </header>
 
-      {/* Counter grid: hidden below 600px, 2 cols 600-699, 3 cols 700-1199, one row of all counters from 1200 */}
-      <section className="hidden flex-1 auto-rows-fr gap-[22px] p-6 min-[600px]:grid min-[600px]:grid-cols-[repeat(2,minmax(0,1fr))] min-[700px]:grid-cols-[repeat(3,minmax(0,1fr))] min-[1200px]:auto-cols-fr min-[1200px]:grid-flow-col min-[1200px]:grid-cols-none">
+      {/* Counter grid: one row of all counters on landscape screens (column count from the data) */}
+      <section className="counter-grid" style={{ "--counter-count": counters.length } as CSSProperties}>
         {counters.map((c) => (
           // Keyed by token so a new number remounts the card and replays the attention pulse
           <CounterTile key={`${c.key}-${c.value ?? "idle"}`} kind={c.kind} label={c.label} value={c.value} t={t} />
@@ -489,10 +489,13 @@ function CounterTile({
 }) {
   const serving = value !== null
   const state = serving ? "counter-card--serving counter-card--attention" : ""
+  const headerRef = useFitText<HTMLDivElement>(label)
 
   return (
     <div className={`counter-card counter-card--${kind} ${state}`}>
-      <div className="counter-card__header">{label}</div>
+      <div ref={headerRef} className="counter-card__header">
+        {label}
+      </div>
       <div className="counter-card__body">
         {serving ? (
           <>
@@ -517,4 +520,37 @@ function CounterTile({
       </div>
     </div>
   )
+}
+
+// Shrinks an element's font size so its single line of text fits its width,
+// instead of wrapping or overflowing. Re-fits when the text or size changes.
+function useFitText<T extends HTMLElement>(text: string) {
+  const ref = useRef<T>(null)
+
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+
+    const fit = () => {
+      el.style.fontSize = ""
+      const style = getComputedStyle(el)
+      const available = el.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+      const needed = el.scrollWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+      if (needed > available && needed > 0) {
+        const size = parseFloat(style.fontSize) * (available / needed) * 0.97
+        el.style.fontSize = `${Math.max(size, 8)}px`
+      }
+    }
+
+    fit()
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", fit)
+      return () => window.removeEventListener("resize", fit)
+    }
+    const observer = new ResizeObserver(fit)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [text])
+
+  return ref
 }
