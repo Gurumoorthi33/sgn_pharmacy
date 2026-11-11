@@ -1,0 +1,10 @@
+[
+  { "username": "e1",       "password": "CHANGE-ME", "role": "entry",      "counter": 1, "full_name": "Entry Counter 1" },
+  { "username": "e2",       "password": "CHANGE-ME", "role": "entry",      "counter": 2, "full_name": "Entry Counter 2" },
+  { "username": "e3",       "password": "CHANGE-ME", "role": "entry",      "counter": 3, "full_name": "Entry Counter 3" },
+  { "username": "e4",       "password": "CHANGE-ME", "role": "entry",      "counter": 4, "full_name": "Entry Counter 4" },
+  { "username": "p1",       "password": "CHANGE-ME", "role": "payment",                  "full_name": "Payment Counter" },
+  { "username": "d1",       "password": "CHANGE-ME", "role": "dispatch",                 "full_name": "Dispatch Counter" },
+  { "username": "disp1",    "password": "CHANGE-ME", "role": "dispensing",               "full_name": "Dispensing" },
+  { "username": "adminsrm", "password": "CHANGE-ME", "role": "admin",                    "full_name": "Administrator" }
+]

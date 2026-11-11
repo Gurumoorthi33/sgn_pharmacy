@@ -14,9 +14,11 @@ export async function requireRole(expected: Role) {
     .from("profiles")
     .select("full_name, role, username, counter")
     .eq("id", user.id)
-    .single()
+    .maybeSingle()
 
-  const role = (profile?.role ?? "entry") as Role
+  const role = profile?.role as Role | undefined
+  // No token-system profile (e.g. an account from another app): no station.
+  if (!role || !(role in ROLE_HOME)) redirect("/auth/login")
 
   // Send users to their own station if they hit the wrong one.
   if (role !== expected) redirect(ROLE_HOME[role])

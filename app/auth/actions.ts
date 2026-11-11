@@ -62,10 +62,15 @@ export async function loginAction(_prev: unknown, formData: FormData) {
     data: { user },
   } = await supabase.auth.getUser()
 
-  let role: Role = "entry"
-  if (user) {
-    const { data: profile } = await supabase.from("profiles").select("role").eq("id", user.id).single()
-    if (profile?.role) role = profile.role as Role
+  // Only accounts with an SGN token-system profile may sign in. The Supabase
+  // project's user list can also contain accounts from other apps.
+  const { data: profile } = user
+    ? await supabase.from("profiles").select("role").eq("id", user.id).maybeSingle()
+    : { data: null }
+  const role = profile?.role as Role | undefined
+  if (!role || !(role in ROLE_HOME)) {
+    await supabase.auth.signOut()
+    return { error: "This account does not have access to the SGN Token System." }
   }
 
   redirect(ROLE_HOME[role])

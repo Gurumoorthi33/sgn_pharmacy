@@ -8,7 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Download, Mail, Activity, Users, CreditCard, PackageCheck } from "lucide-react"
 
 export function AdminDashboard() {
-  const { tokens } = useTokens()
+  const { tokens } = useTokens({ includeCompleted: true })
   const [pending, startTransition] = useTransition()
   const [msg, setMsg] = useState<string | null>(null)
 

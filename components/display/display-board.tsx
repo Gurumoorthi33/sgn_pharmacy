@@ -85,24 +85,80 @@ export function DisplayBoard() {
   const audioQueueRef = useRef<QueueItem[]>([])
   const isPlayingRef = useRef(false)
 
-  // Load + subscribe to the live board
+  // Load + subscribe to the live board.
+  //
+  // Egress-conscious: the board is pushed by the database over a Realtime
+  // broadcast ("display-board" channel, see scripts/migration_egress.sql), so
+  // no request is needed per change. Until realtime has proven it is
+  // delivering updates (e.g. the migration has not been run yet, or the
+  // connection is down) the board keeps polling at the original 3 s cadence,
+  // so announcements are never delayed. Once live, polling drops to a 60 s
+  // safety re-sync. Polling pauses while the tab is hidden.
   useEffect(() => {
     let active = true
+    let subscribed = false
+    let liveProven = false // a realtime message has actually arrived
+    let broadcastSeen = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
     const load = async () => {
       const { data } = await supabase.rpc("display_board")
       if (active && data) setRows(data as DisplayRow[])
     }
+
+    const schedule = () => {
+      if (timer) clearTimeout(timer)
+      timer = null
+      if (!active || document.visibilityState !== "visible") return
+      const delay = subscribed && liveProven ? 60_000 : 3_000
+      timer = setTimeout(() => {
+        load().finally(schedule)
+      }, delay)
+    }
+
     load()
 
     const channel = supabase
-      .channel("display-tokens")
-      .on("postgres_changes", { event: "*", schema: "public", table: "tokens" }, () => load())
-      .subscribe()
+      .channel("display-board")
+      // Preferred path: the full board pushed by the database trigger.
+      .on("broadcast", { event: "board" }, ({ payload }) => {
+        const next = (payload as { rows?: DisplayRow[] } | undefined)?.rows
+        if (!active || !Array.isArray(next)) return
+        const wasProven = liveProven
+        liveProven = true
+        broadcastSeen = true
+        setRows(next)
+        if (!wasProven) schedule()
+      })
+      // Also works when the anon role can see token changes; ignored once
+      // broadcasts are flowing so a change never costs two requests.
+      .on("postgres_changes", { event: "*", schema: "public", table: "tokens" }, () => {
+        if (!active || broadcastSeen) return
+        const wasProven = liveProven
+        liveProven = true
+        load()
+        if (!wasProven) schedule()
+      })
+      .subscribe((status) => {
+        const wasSubscribed = subscribed
+        subscribed = status === "SUBSCRIBED"
+        // (Re)connected: re-sync once to cover anything missed while down.
+        if (subscribed && !wasSubscribed) load()
+        if (!subscribed) liveProven = false
+        schedule()
+      })
 
-    const poll = setInterval(load, 3000)
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") load()
+      schedule()
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    schedule()
+
     return () => {
       active = false
-      clearInterval(poll)
+      if (timer) clearTimeout(timer)
+      document.removeEventListener("visibilitychange", onVisibility)
       supabase.removeChannel(channel)
     }
   }, [supabase])
