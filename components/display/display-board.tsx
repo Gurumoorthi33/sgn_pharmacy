@@ -4,7 +4,7 @@ import Image from "next/image"
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createClient } from "@/lib/supabase/client"
 import { HOSPITAL_NAME, SYSTEM_NAME } from "@/lib/types"
-import { Volume2 } from "lucide-react"
+import { ArrowRight, Volume2 } from "lucide-react"
 
 type DisplayRow = {
   station: "entry" | "payment" | "dispatch"
@@ -489,6 +489,18 @@ export function DisplayBoard() {
   const counterValue = (station: DisplayRow["station"], counter?: number) =>
     rows.find((r) => r.station === station && (counter === undefined || r.counter === counter))?.token_number ?? null
 
+  // The most recent call (new call OR "Call again") across all counters. This
+  // is what the patients need to see first: which token, which counter.
+  let latest: { key: string; time: string } | null = null
+  for (const r of rows) {
+    const called = r.called_at ?? ""
+    const recalled = r.recalled_at ?? ""
+    const time = recalled > called ? recalled : called
+    if (time && (!latest || time > latest.time)) {
+      latest = { key: r.station === "entry" ? `entry-${r.counter}` : r.station, time }
+    }
+  }
+
   const counters: { key: string; kind: DisplayRow["station"]; label: string; value: number | null }[] = [
     ...ENTRY_COUNTERS.map((n) => ({ key: `entry-${n}`, kind: "entry" as const, label: `${t.entry} ${n}`, value: counterValue("entry", n) })),
     { key: "payment", kind: "payment", label: t.payment, value: counterValue("payment") },
@@ -521,14 +533,62 @@ export function DisplayBoard() {
         </div>
       </header>
 
+      {/* Now calling: the latest call, very large, in the counter's colour */}
+      <NowCalling calling={counters.find((c) => c.key === latest?.key && c.value !== null) ?? null} callKey={latest?.time ?? ""} t={t} />
+
       {/* Counter grid: one row of all counters on landscape screens (column count from the data) */}
       <section className="counter-grid" style={{ "--counter-count": counters.length } as CSSProperties}>
         {counters.map((c) => (
           // Keyed by token so a new number remounts the card and replays the attention pulse
-          <CounterTile key={`${c.key}-${c.value ?? "idle"}`} kind={c.kind} label={c.label} value={c.value} t={t} />
+          <CounterTile
+            key={`${c.key}-${c.value ?? "idle"}`}
+            kind={c.kind}
+            label={c.label}
+            value={c.value}
+            calling={c.key === latest?.key && c.value !== null}
+            t={t}
+          />
         ))}
       </section>
     </main>
+  )
+}
+
+function NowCalling({
+  calling,
+  callKey,
+  t,
+}: {
+  calling: { kind: DisplayRow["station"]; label: string; value: number | null } | null
+  callKey: string
+  t: (typeof STRINGS)[Lang]
+}) {
+  // callKey included so the fit re-runs on the freshly mounted element per call
+  const counterRef = useFitText<HTMLSpanElement>(`${calling?.label ?? ""}|${callKey}`)
+
+  if (!calling || calling.value === null) {
+    return (
+      <section className="now-calling now-calling--idle" aria-live="polite">
+        <span className="now-calling__idle">{t.idle}</span>
+      </section>
+    )
+  }
+
+  return (
+    // Keyed by the call time so every new call / "Call again" replays the flash
+    <section key={callKey} className={`now-calling now-calling--${calling.kind}`} aria-live="polite">
+      <span className="now-calling__label">{t.nowServing}</span>
+      <div className="now-calling__main">
+        <span className="now-calling__token">
+          <span className="now-calling__token-label">{t.token}</span>
+          <span className="now-calling__number">{calling.value}</span>
+        </span>
+        <ArrowRight className="now-calling__arrow" aria-hidden="true" />
+        <span ref={counterRef} className="now-calling__counter">
+          {calling.label}
+        </span>
+      </div>
+    </section>
   )
 }
 
@@ -536,15 +596,19 @@ function CounterTile({
   kind,
   label,
   value,
+  calling,
   t,
 }: {
   kind: DisplayRow["station"]
   label: string
   value: number | null
+  calling: boolean
   t: (typeof STRINGS)[Lang]
 }) {
   const serving = value !== null
-  const state = serving ? "counter-card--serving counter-card--attention" : ""
+  const state = serving
+    ? `counter-card--serving counter-card--attention${calling ? " counter-card--calling" : ""}`
+    : ""
   const headerRef = useFitText<HTMLDivElement>(label)
 
   return (

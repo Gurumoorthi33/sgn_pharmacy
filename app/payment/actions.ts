@@ -1,14 +1,12 @@
 "use server"
 
 import { createClient } from "@/lib/supabase/server"
+import { getUserId } from "@/lib/supabase/auth"
 import type { Token } from "@/lib/types"
 
 async function client() {
   const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) throw new Error("Not authenticated")
+  if (!(await getUserId(supabase))) throw new Error("Not authenticated")
   return supabase
 }
 
@@ -24,9 +22,13 @@ export async function callNextPaymentAction(): Promise<{ token?: Token | null; e
 }
 
 export async function completePaymentAction(id: string): Promise<{ error?: string }> {
-  const supabase = await client()
-  const { error } = await supabase.rpc("complete_payment", { p_id: id })
-  return error ? { error: error.message } : {}
+  try {
+    const supabase = await client()
+    const { error } = await supabase.rpc("complete_payment", { p_id: id })
+    return error ? { error: error.message } : {}
+  } catch (e) {
+    return { error: (e as Error).message }
+  }
 }
 
 // Hold the currently-serving token AND immediately call the next fresh token.

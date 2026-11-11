@@ -407,8 +407,8 @@ html.display-mode body {
 /* ---- Counter grid: always ONE row of all counters on landscape screens ---- */
 .counter-grid {
   --cols: var(--counter-count, 6);
-  --grid-pad: 1.2vw;
-  --grid-gap: 1.1vw;
+  --grid-pad: 1vw;
+  --grid-gap: 0.9vw;
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
@@ -501,16 +501,16 @@ html.display-mode body {
   color: rgba(255, 255, 255, 0.8);
 }
 
-/* Token number: clamp(48px, 7vw, 220px), additionally capped so that
-   --digits digits (~0.62em each) use at most 80% of one card's width,
-   and by height for very wide/short screens. */
+/* Token number: clamp(56px, 8.5vw, 260px), additionally capped so that
+   --digits digits (~0.6em each with the tight tracking below) use at most
+   90% of one card's width, and by height for very wide/short screens. */
 .counter-card__number {
   --card-w: calc((100vw - 2 * var(--grid-pad) - (var(--cols) - 1) * var(--grid-gap)) / var(--cols));
-  font-size: 7vw;
-  font-size: min(clamp(48px, 7vw, 220px), calc(var(--card-w) * 0.8 / (var(--digits, 3) * 0.62)), 22vh);
+  font-size: 8vw;
+  font-size: min(clamp(56px, 8.5vw, 260px), calc(var(--card-w) * 0.9 / (var(--digits, 3) * 0.6)), 26vh);
   font-weight: 800;
   line-height: 1;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.04em;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   color: #fff;
@@ -563,6 +563,139 @@ html.display-mode body {
   background: var(--c-primary);
 }
 
+/* The counter that is calling right now: thick ring in its colour + blinking dot */
+.counter-card--calling {
+  outline: 0.45vw solid var(--c-primary);
+  outline-offset: 0.25vw;
+}
+.counter-card--calling .counter-card__dot {
+  animation: calling-dot 1s steps(2, jump-none) infinite;
+}
+@keyframes calling-dot {
+  50% {
+    opacity: 0.15;
+  }
+}
+
+/* ---- "Now calling" banner: the latest call, readable from across the hall ---- */
+.now-calling {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.6vh;
+  height: 24vh;
+  margin: 1vw 1vw 0;
+  padding: 1.2vh 2.5vw;
+  overflow: hidden;
+  border-radius: 0.9vw;
+  background: var(--c-primary);
+  color: #fff;
+  box-shadow: var(--counter-shadow);
+  animation: now-calling-flash 0.9s ease-in-out 3;
+}
+.now-calling--entry {
+  --c-primary: var(--counter-entry);
+  --c-dark: var(--counter-entry-dark);
+  --c-ring: var(--counter-entry-ring);
+}
+.now-calling--payment {
+  --c-primary: var(--counter-payment);
+  --c-dark: var(--counter-payment-dark);
+  --c-ring: var(--counter-payment-ring);
+}
+.now-calling--dispatch {
+  --c-primary: var(--counter-dispatch);
+  --c-dark: var(--counter-dispatch-dark);
+  --c-ring: var(--counter-dispatch-ring);
+}
+.now-calling__label {
+  font-size: clamp(12px, 1.4vw, 36px);
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+.now-calling__main {
+  display: flex;
+  align-items: center;
+  gap: 2.2vw;
+  min-width: 0;
+}
+.now-calling__token {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 1vw;
+}
+.now-calling__token-label {
+  font-size: clamp(16px, 2.6vw, 70px);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.now-calling__number {
+  font-size: min(15vh, 11vw);
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+.now-calling__arrow {
+  flex: none;
+  width: min(9vh, 6vw);
+  height: min(9vh, 6vw);
+  stroke-width: 3;
+}
+.now-calling__counter {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0.25em 0.6em;
+  border-radius: 0.4em;
+  background: #fff;
+  color: var(--c-dark);
+  font-size: min(8vh, 4.6vw);
+  font-weight: 800;
+  line-height: 1.15;
+  text-align: center;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.now-calling--idle {
+  align-items: center;
+  background: #fff;
+  color: #475569;
+  animation: none;
+}
+.now-calling__idle {
+  font-size: clamp(16px, 2.2vw, 56px);
+  font-weight: 600;
+  text-align: center;
+}
+:lang(ta) .now-calling__label,
+:lang(ta) .now-calling__token-label,
+:lang(ta) .now-calling__counter {
+  letter-spacing: normal;
+  text-transform: none;
+}
+@keyframes now-calling-flash {
+  0% {
+    box-shadow: var(--counter-shadow), 0 0 0 0 var(--c-ring);
+  }
+  50% {
+    filter: brightness(1.18);
+  }
+  100% {
+    box-shadow: var(--counter-shadow), 0 0 0 1vw rgba(0, 0, 0, 0);
+  }
+}
+@media (orientation: portrait) {
+  .now-calling {
+    height: 16vh;
+  }
+}
+
 /* Attention pulse when a new token appears on a card */
 @keyframes counter-attention {
   0% {
@@ -582,7 +715,9 @@ html.display-mode body {
   animation: counter-attention 0.85s ease-in-out 3;
 }
 @media (prefers-reduced-motion: reduce) {
-  .counter-card--attention {
+  .counter-card--attention,
+  .counter-card--calling .counter-card__dot,
+  .now-calling {
     animation: none;
   }
 }

@@ -47,9 +47,11 @@ export async function loginAction(_prev: unknown, formData: FormData) {
   const supabase = await createClient()
 
   let error: unknown = null
+  let user: { id: string } | null = null
   try {
     const result = await supabase.auth.signInWithPassword({ email, password })
     error = result.error
+    user = result.data.user
   } catch (thrown) {
     error = thrown
   }
@@ -57,10 +59,6 @@ export async function loginAction(_prev: unknown, formData: FormData) {
   if (error) {
     return { error: describeAuthError(error) }
   }
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
 
   // Only accounts with an SGN token-system profile may sign in. The Supabase
   // project's user list can also contain accounts from other apps.

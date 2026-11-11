@@ -1,19 +1,17 @@
 import { createClient } from "@/lib/supabase/server"
+import { getUserId } from "@/lib/supabase/auth"
 import { ROLE_HOME, type Role } from "@/lib/types"
 import { redirect } from "next/navigation"
 
 export async function requireRole(expected: Role) {
   const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) redirect("/auth/login")
+  const userId = await getUserId(supabase)
+  if (!userId) redirect("/auth/login")
 
   const { data: profile } = await supabase
     .from("profiles")
     .select("full_name, role, username, counter")
-    .eq("id", user.id)
+    .eq("id", userId)
     .maybeSingle()
 
   const role = profile?.role as Role | undefined
@@ -24,7 +22,7 @@ export async function requireRole(expected: Role) {
   if (role !== expected) redirect(ROLE_HOME[role])
 
   return {
-    user,
+    userId,
     role,
     fullName: profile?.full_name ?? "",
     username: profile?.username ?? "",

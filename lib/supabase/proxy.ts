@@ -21,9 +21,10 @@ export async function updateSession(request: NextRequest) {
     },
   )
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  // getClaims() verifies the JWT locally (refreshing the session cookies when
+  // needed) instead of a network round trip to the Auth server per request.
+  const { data } = await supabase.auth.getClaims()
+  const user = data?.claims?.sub ?? null
 
   const path = request.nextUrl.pathname
   const isPublic = path.startsWith("/auth") || path === "/" || path.startsWith("/display")
