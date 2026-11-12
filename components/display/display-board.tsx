@@ -54,6 +54,24 @@ const STRINGS = {
 
 type Lang = keyof typeof STRINGS
 
+// One row per counter. If the database ever returns two rows for the same
+// counter (e.g. a token from a previous day left "serving" because the nightly
+// reset was missed), keep the most recent call so the live token is shown.
+function latestPerCounter(rows: DisplayRow[]): DisplayRow[] {
+  const callTime = (r: DisplayRow) => {
+    const c = r.called_at ? Date.parse(r.called_at) : 0
+    const rc = r.recalled_at ? Date.parse(r.recalled_at) : 0
+    return Math.max(c || 0, rc || 0)
+  }
+  const best = new Map<string, DisplayRow>()
+  for (const r of rows) {
+    const key = `${r.station}-${r.counter ?? ""}`
+    const prev = best.get(key)
+    if (!prev || callTime(r) >= callTime(prev)) best.set(key, r)
+  }
+  return [...best.values()]
+}
+
 const ENTRY_COUNTERS = [1, 2, 3, 4]
 
 export function DisplayBoard() {
@@ -103,7 +121,7 @@ export function DisplayBoard() {
 
     const load = async () => {
       const { data } = await supabase.rpc("display_board")
-      if (active && data) setRows(data as DisplayRow[])
+      if (active && data) setRows(latestPerCounter(data as DisplayRow[]))
     }
 
     const schedule = () => {
@@ -127,7 +145,7 @@ export function DisplayBoard() {
         const wasProven = liveProven
         liveProven = true
         broadcastSeen = true
-        setRows(next)
+        setRows(latestPerCounter(next))
         if (!wasProven) schedule()
       })
       // Also works when the anon role can see token changes; ignored once
