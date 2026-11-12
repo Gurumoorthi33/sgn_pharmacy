@@ -4,6 +4,7 @@ import { createAdminClient } from "@/lib/supabase/server"
 import { HOSPITAL_NAME, REPORT_RECIPIENTS } from "@/lib/types"
 
 export type DayStats = {
+  service_date?: string // the day these stats are for (set by reset_day)
   total: number
   first_token: number | null
   last_token: number | null

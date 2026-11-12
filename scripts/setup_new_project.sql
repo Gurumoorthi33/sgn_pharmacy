@@ -13,6 +13,8 @@
 -- (scripts/migration_egress.sql is already folded in).
 --
 -- HOW TO RUN: new project → SQL Editor → paste all → Run. Safe to re-run.
+-- THEN ALSO RUN scripts/migration_daily_reset_fix.sql (today-only display
+-- board + reliable nightly reset).
 -- ============================================================
 
 -- ─── 1. Tables ──────────────────────────────────────────────

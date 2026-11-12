@@ -16,17 +16,18 @@ export async function GET(request: Request) {
     }
   }
 
-  const date = todayIST()
   const admin = createAdminClient()
 
-  // reset_day() logs today's totals into daily_summaries, deletes today's
-  // tokens, and returns the stats snapshot.
+  // reset_day() archives the day's totals into daily_summaries and clears its
+  // tokens (plus any earlier day that was missed), returning the stats of the
+  // day it archived — which may be yesterday if the cron fired after midnight.
   const { data, error } = await admin.rpc("reset_day")
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
   const stats = data as DayStats
+  const date = stats.service_date ?? todayIST()
   let emailed = false
   try {
     emailed = await emailDailyReport(date, stats)
